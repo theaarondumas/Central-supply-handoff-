@@ -275,8 +275,7 @@ export default function Page() {
 
       const payload = {
         author_user_id: user.id,
-        author_display_name_snapshot: displayName?.trim() || null,
-
+        
         shift,
         location: location.trim(),
         priority,
