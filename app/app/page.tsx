@@ -6,8 +6,6 @@ import { createClient, SupabaseClient } from "@supabase/supabase-js";
 type Shift = "AM" | "PM" | "NOC";
 type Priority = "Low" | "Normal" | "High" | "Critical";
 
-// NOTE: Your DB handoffs table does NOT have author_user_id or author_display_name_snapshot.
-// Keep this type aligned with your actual handoffs columns.
 type Handoff = {
   id: string;
   created_at: string;
@@ -24,7 +22,6 @@ type Handoff = {
 
 type UpdateSource = "app" | "sms" | "system";
 
-// NOTE: Your handoff_updates table DOES have author_user_id + author_display_name_snapshot.
 type HandoffUpdate = {
   id: string;
   created_at: string;
@@ -77,6 +74,14 @@ function errToMsg(err: any) {
   );
 }
 
+function isAbortError(err: any) {
+  return (
+    err?.name === "AbortError" ||
+    err?.message?.toLowerCase?.().includes("aborted") ||
+    err?.code === "ERR_ABORTED"
+  );
+}
+
 export default function Page() {
   const [supabase] = useState(() => getSupabase());
 
@@ -85,7 +90,7 @@ export default function Page() {
   const [email, setEmail] = useState("");
   const [sendingLink, setSendingLink] = useState(false);
 
-  // Optional display name snapshot (used ONLY when writing handoff_updates)
+  // Display name snapshot (used ONLY for handoff_updates)
   const [displayName, setDisplayName] = useState("JD");
 
   // Data
@@ -112,7 +117,7 @@ export default function Page() {
   // Derived "resolved" (from updates)
   const [resolvedIds, setResolvedIds] = useState<Set<string>>(new Set());
 
-  // ✅ MOBILE RESPONSIVE FLAG
+  // Mobile responsive
   const [isMobile, setIsMobile] = useState(false);
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -123,7 +128,7 @@ export default function Page() {
     return () => mq.removeEventListener?.("change", apply);
   }, []);
 
-  // ✅ MOBILE DRAWER
+  // Mobile drawer
   const [drawerOpen, setDrawerOpen] = useState(false);
   function openDrawerFor(id: string) {
     setSelectedId(id);
@@ -161,69 +166,6 @@ export default function Page() {
   }
 
   // ---------------- LOADERS ----------------
-  async function loadHandoffs() {
-    setLoading(true);
-    try {
-      const { data: userRes, error: userErr } = await supabase.auth.getUser();
-      if (userErr) throw userErr;
-      if (!userRes?.user) {
-        setHandoffs([]);
-        setResolvedIds(new Set());
-        return;
-      }
-
-      const { data, error } = await supabase
-        .from("handoffs")
-        .select("*")
-        .order("needs_follow_up", { ascending: false })
-        .order("priority", { ascending: false })
-        .order("created_at", { ascending: false });
-
-      if (error) throw error;
-
-      // Make sure nullables are normalized
-      const rows = ((data ?? []) as Handoff[]).map((h) => ({
-        ...h,
-        details: h.details ?? null,
-      }));
-
-      setHandoffs(rows);
-      await loadResolvedIndex(rows.map((r) => r.id));
-    } catch (err: any) {
-      console.error("LoadHandoffs FULL error:", err);
-      alert("Error loading handoffs:\n" + errToMsg(err));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function loadUpdates(handoffId: string) {
-    setLoading(true);
-    try {
-      const { data: userRes, error: userErr } = await supabase.auth.getUser();
-      if (userErr) throw userErr;
-      if (!userRes?.user) {
-        setUpdates([]);
-        return;
-      }
-
-      const { data, error } = await supabase
-        .from("handoff_updates")
-        .select("*")
-        .eq("handoff_id", handoffId)
-        .order("created_at", { ascending: true });
-
-      if (error) throw error;
-
-      setUpdates((data ?? []) as HandoffUpdate[]);
-    } catch (err: any) {
-      console.error("LoadUpdates FULL error:", err);
-      alert("Error loading updates:\n" + errToMsg(err));
-    } finally {
-      setLoading(false);
-    }
-  }
-
   async function loadResolvedIndex(handoffIds: string[]) {
     if (handoffIds.length === 0) {
       setResolvedIds(new Set());
@@ -251,9 +193,73 @@ export default function Page() {
     setResolvedIds(s);
   }
 
+  async function loadHandoffs() {
+    setLoading(true);
+    try {
+      const { data: userRes, error: userErr } = await supabase.auth.getUser();
+      if (userErr) throw userErr;
+      if (!userRes?.user) {
+        setHandoffs([]);
+        setResolvedIds(new Set());
+        return;
+      }
+
+      const { data, error } = await supabase
+        .from("handoffs")
+        .select("*")
+        .order("needs_follow_up", { ascending: false })
+        .order("priority", { ascending: false })
+        .order("created_at", { ascending: false });
+
+      if (error) throw error;
+
+      const rows = ((data ?? []) as Handoff[]).map((h) => ({
+        ...h,
+        details: h.details ?? null,
+      }));
+
+      setHandoffs(rows);
+      await loadResolvedIndex(rows.map((r) => r.id));
+    } catch (err: any) {
+      if (isAbortError(err)) return;
+      console.error("LoadHandoffs FULL error:", err);
+      alert("Error loading handoffs:\n" + errToMsg(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadUpdates(handoffId: string) {
+    setLoading(true);
+    try {
+      const { data: userRes, error: userErr } = await supabase.auth.getUser();
+      if (userErr) throw userErr;
+      if (!userRes?.user) {
+        setUpdates([]);
+        return;
+      }
+
+      const { data, error } = await supabase
+        .from("handoff_updates")
+        .select("*")
+        .eq("handoff_id", handoffId)
+        .order("created_at", { ascending: true });
+
+      if (error) throw error;
+
+      setUpdates((data ?? []) as HandoffUpdate[]);
+    } catch (err: any) {
+      if (isAbortError(err)) return;
+      console.error("LoadUpdates FULL error:", err);
+      alert("Error loading updates:\n" + errToMsg(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
   // ---------------- ACTIONS ----------------
 
-  // ✅ IMPORTANT: no author_user_id / author_display_name_snapshot in handoffs insert
+  // ✅ IMPORTANT: handoffs insert matches your DB schema (NO author_user_id / snapshot here)
   async function createHandoff() {
     if (!summary.trim()) {
       alert("Summary is required.");
@@ -274,7 +280,6 @@ export default function Page() {
         shift,
         location: location.trim(),
         priority,
-
         summary: summary.trim(),
         details: details.trim() || null,
         needs_follow_up: !!needsFollowUp,
@@ -285,9 +290,9 @@ export default function Page() {
 
       setSummary("");
       setDetails("");
-
       await loadHandoffs();
     } catch (err: any) {
+      if (isAbortError(err)) return;
       console.error("Insert error:", err);
       alert("Error saving handoff:\n" + errToMsg(err));
     } finally {
@@ -295,7 +300,6 @@ export default function Page() {
     }
   }
 
-  // ✅ Resolve is append-only via handoff_updates (auth fields live here)
   async function markResolved(handoffId: string) {
     setLoading(true);
     try {
@@ -320,6 +324,7 @@ export default function Page() {
       await loadHandoffs();
       if (selectedId === handoffId) await loadUpdates(handoffId);
     } catch (err: any) {
+      if (isAbortError(err)) return;
       console.error("Resolve error:", err);
       alert("Error marking resolved:\n" + errToMsg(err));
     } finally {
@@ -327,7 +332,6 @@ export default function Page() {
     }
   }
 
-  // ✅ Append-only update via handoff_updates
   async function addUpdate() {
     if (!selectedId) {
       alert("Select a handoff first.");
@@ -358,6 +362,7 @@ export default function Page() {
       setNewUpdate("");
       await loadUpdates(selectedId);
     } catch (err: any) {
+      if (isAbortError(err)) return;
       console.error("Add update error:", err);
       alert("Error adding update:\n" + errToMsg(err));
     } finally {
@@ -449,14 +454,7 @@ export default function Page() {
   return (
     <div style={{ maxWidth: 1100, margin: "0 auto", padding: isMobile ? 14 : 20 }}>
       <header style={{ marginBottom: 16 }}>
-        <div
-          style={{
-            display: "flex",
-            gap: 12,
-            alignItems: "center",
-            flexWrap: "wrap",
-          }}
-        >
+        <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
           <div>
             <h1 style={{ fontSize: 34, fontWeight: 800, margin: 0 }}>Central Supply Handoff</h1>
             <p style={{ marginTop: 6, opacity: 0.75 }}>
@@ -492,15 +490,7 @@ export default function Page() {
       </header>
 
       {/* Filters */}
-      <div
-        style={{
-          display: "flex",
-          gap: 12,
-          alignItems: "center",
-          flexWrap: "wrap",
-          marginBottom: 16,
-        }}
-      >
+      <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap", marginBottom: 16 }}>
         <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <input
             type="checkbox"
@@ -514,11 +504,7 @@ export default function Page() {
           placeholder="Filter location…"
           value={locationFilter}
           onChange={(e) => setLocationFilter(e.target.value)}
-          style={{
-            ...inputStyle,
-            minWidth: isMobile ? 0 : 220,
-            flex: isMobile ? 1 : "unset",
-          }}
+          style={{ ...inputStyle, minWidth: isMobile ? 0 : 220, flex: isMobile ? 1 : "unset" }}
         />
 
         <div style={{ marginLeft: "auto", opacity: 0.8 }}>
@@ -530,44 +516,19 @@ export default function Page() {
         </button>
       </div>
 
-      {/* Create + Updates (desktop panel only) */}
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr",
-          gap: 16,
-        }}
-      >
-        {/* Create handoff */}
-        <section
-          style={{
-            border: "1px solid rgba(255,255,255,.12)",
-            borderRadius: 16,
-            padding: 16,
-            marginBottom: 18,
-          }}
-        >
+      {/* Create + desktop Updates */}
+      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap: 16 }}>
+        <section style={{ border: "1px solid rgba(255,255,255,.12)", borderRadius: 16, padding: 16, marginBottom: 18 }}>
           <h2 style={{ margin: 0, marginBottom: 12, fontSize: 18 }}>Create handoff</h2>
 
-          <div
-            style={{
-              display: "grid",
-              gap: 10,
-              gridTemplateColumns: isMobile ? "1fr 1fr" : "1fr 1fr 1fr 1fr",
-            }}
-          >
+          <div style={{ display: "grid", gap: 10, gridTemplateColumns: isMobile ? "1fr 1fr" : "1fr 1fr 1fr 1fr" }}>
             <select value={shift} onChange={(e) => setShift(e.target.value as Shift)} style={inputStyle}>
               <option value="AM">AM</option>
               <option value="PM">PM</option>
               <option value="NOC">NOC</option>
             </select>
 
-            <input
-              placeholder="Location"
-              value={location}
-              onChange={(e) => setLocation(e.target.value)}
-              style={inputStyle}
-            />
+            <input placeholder="Location" value={location} onChange={(e) => setLocation(e.target.value)} style={inputStyle} />
 
             <select value={priority} onChange={(e) => setPriority(e.target.value as Priority)} style={inputStyle}>
               <option value="Normal">Normal</option>
@@ -577,39 +538,20 @@ export default function Page() {
             </select>
 
             <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              <input
-                type="checkbox"
-                checked={needsFollowUp}
-                onChange={(e) => setNeedsFollowUp(e.target.checked)}
-              />
+              <input type="checkbox" checked={needsFollowUp} onChange={(e) => setNeedsFollowUp(e.target.checked)} />
               Follow-up
             </label>
           </div>
 
           <div style={{ marginTop: 10 }}>
-            <input
-              placeholder="Summary (required)"
-              value={summary}
-              onChange={(e) => setSummary(e.target.value)}
-              style={{ ...inputStyle, width: "100%" }}
-            />
+            <input placeholder="Summary (required)" value={summary} onChange={(e) => setSummary(e.target.value)} style={{ ...inputStyle, width: "100%" }} />
           </div>
 
           <div style={{ marginTop: 10 }}>
-            <textarea
-              placeholder="Details (optional)…"
-              value={details}
-              onChange={(e) => setDetails(e.target.value)}
-              rows={4}
-              style={{ ...inputStyle, width: "100%", resize: "vertical" }}
-            />
+            <textarea placeholder="Details (optional)…" value={details} onChange={(e) => setDetails(e.target.value)} rows={4} style={{ ...inputStyle, width: "100%", resize: "vertical" }} />
           </div>
 
-          <button
-            onClick={createHandoff}
-            disabled={loading}
-            style={{ ...btnStyle, width: "100%", marginTop: 12, fontWeight: 800 }}
-          >
+          <button onClick={createHandoff} disabled={loading} style={{ ...btnStyle, width: "100%", marginTop: 12, fontWeight: 800 }}>
             {loading ? "Saving…" : "Save handoff"}
           </button>
 
@@ -618,16 +560,8 @@ export default function Page() {
           </p>
         </section>
 
-        {/* Updates panel: desktop only */}
         {!isMobile && (
-          <section
-            style={{
-              border: "1px solid rgba(255,255,255,.12)",
-              borderRadius: 16,
-              padding: 16,
-              marginBottom: 18,
-            }}
-          >
+          <section style={{ border: "1px solid rgba(255,255,255,.12)", borderRadius: 16, padding: 16, marginBottom: 18 }}>
             <h2 style={{ margin: 0, marginBottom: 12, fontSize: 18 }}>Updates</h2>
 
             {!selected ? (
@@ -636,16 +570,11 @@ export default function Page() {
               <>
                 <div style={{ display: "grid", gap: 6 }}>
                   <div style={{ fontWeight: 900 }}>{selected.location.toUpperCase()}</div>
-                  <div style={{ opacity: 0.8 }}>
-                    {selected.shift} · {formatWhen(selected.created_at)}
-                  </div>
+                  <div style={{ opacity: 0.8 }}>{selected.shift} · {formatWhen(selected.created_at)}</div>
                   <div style={{ fontWeight: 900 }}>{selected.summary}</div>
-                  {selected.details ? (
-                    <div style={{ opacity: 0.9, whiteSpace: "pre-wrap" }}>{selected.details}</div>
-                  ) : null}
+                  {selected.details ? <div style={{ opacity: 0.9, whiteSpace: "pre-wrap" }}>{selected.details}</div> : null}
                   <div style={{ opacity: 0.8 }}>
-                    {selected.priority} · {selected.needs_follow_up ? "FOLLOW-UP" : "—"} ·{" "}
-                    {resolvedIds.has(selected.id) ? "Resolved" : "Open"}
+                    {selected.priority} · {selected.needs_follow_up ? "FOLLOW-UP" : "—"} · {resolvedIds.has(selected.id) ? "Resolved" : "Open"}
                   </div>
                 </div>
 
@@ -661,46 +590,20 @@ export default function Page() {
 
                 <div style={{ display: "grid", gap: 10 }}>
                   {updates.map((u) => (
-                    <div
-                      key={u.id}
-                      style={{
-                        borderRadius: 12,
-                        padding: 10,
-                        border: "1px solid rgba(255,255,255,.10)",
-                        opacity: 0.95,
-                      }}
-                    >
-                      <div
-                        style={{
-                          display: "flex",
-                          justifyContent: "space-between",
-                          gap: 10,
-                          fontSize: 12,
-                          opacity: 0.8,
-                        }}
-                      >
-                        <div>
-                          {(u.author_display_name_snapshot ?? "—")} · {u.source}
-                        </div>
+                    <div key={u.id} style={{ borderRadius: 12, padding: 10, border: "1px solid rgba(255,255,255,.10)", opacity: 0.95 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, fontSize: 12, opacity: 0.8 }}>
+                        <div>{(u.author_display_name_snapshot ?? "—")} · {u.source}</div>
                         <div>{formatWhen(u.created_at)}</div>
                       </div>
                       <div style={{ marginTop: 6, whiteSpace: "pre-wrap" }}>{u.content}</div>
                     </div>
                   ))}
-
                   {updates.length === 0 && <div style={{ opacity: 0.7 }}>No updates yet.</div>}
                 </div>
 
                 <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
-                  <input
-                    placeholder="Add an update (append-only)…"
-                    value={newUpdate}
-                    onChange={(e) => setNewUpdate(e.target.value)}
-                    style={{ ...inputStyle, flex: 1 }}
-                  />
-                  <button onClick={addUpdate} disabled={loading || !newUpdate.trim()} style={btnStyle}>
-                    Add
-                  </button>
+                  <input placeholder="Add an update (append-only)…" value={newUpdate} onChange={(e) => setNewUpdate(e.target.value)} style={{ ...inputStyle, flex: 1 }} />
+                  <button onClick={addUpdate} disabled={loading || !newUpdate.trim()} style={btnStyle}>Add</button>
                 </div>
               </>
             )}
@@ -730,10 +633,7 @@ export default function Page() {
             >
               <div style={{ display: "flex", gap: 10, alignItems: "baseline", flexWrap: "wrap" }}>
                 <div style={{ fontWeight: 900, letterSpacing: 0.3 }}>{h.location.toUpperCase()}</div>
-
-                <div style={{ opacity: 0.8 }}>
-                  {h.shift} · {formatWhen(h.created_at)}
-                </div>
+                <div style={{ opacity: 0.8 }}>{h.shift} · {formatWhen(h.created_at)}</div>
 
                 <div style={{ marginLeft: "auto", opacity: 0.8 }}>
                   {h.priority}
@@ -746,19 +646,15 @@ export default function Page() {
                 {h.summary.toUpperCase()}
               </div>
 
-              {h.details ? (
-                <div style={{ marginTop: 6, opacity: 0.9, whiteSpace: "pre-wrap" }}>{h.details}</div>
-              ) : null}
+              {h.details ? <div style={{ marginTop: 6, opacity: 0.9, whiteSpace: "pre-wrap" }}>{h.details}</div> : null}
             </button>
           );
         })}
 
-        {!loading && filtered.length === 0 && (
-          <div style={{ opacity: 0.7, padding: 12 }}>No handoffs match your filters.</div>
-        )}
+        {!loading && filtered.length === 0 && <div style={{ opacity: 0.7, padding: 12 }}>No handoffs match your filters.</div>}
       </section>
 
-      {/* ✅ MOBILE DRAWER */}
+      {/* Mobile Drawer */}
       {isMobile && drawerOpen && (
         <div
           onClick={closeDrawer}
@@ -785,30 +681,13 @@ export default function Page() {
               overflow: "hidden",
             }}
           >
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                padding: "10px 12px",
-                borderBottom: "1px solid rgba(255,255,255,.10)",
-              }}
-            >
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 12px", borderBottom: "1px solid rgba(255,255,255,.10)" }}>
               <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                <div
-                  style={{
-                    width: 40,
-                    height: 5,
-                    borderRadius: 999,
-                    background: "rgba(255,255,255,.18)",
-                  }}
-                />
+                <div style={{ width: 40, height: 5, borderRadius: 999, background: "rgba(255,255,255,.18)" }} />
                 <div style={{ fontWeight: 800, opacity: 0.9 }}>Handoff</div>
               </div>
 
-              <button onClick={closeDrawer} style={{ ...btnStyle, padding: "8px 10px" }}>
-                Close
-              </button>
+              <button onClick={closeDrawer} style={{ ...btnStyle, padding: "8px 10px" }}>Close</button>
             </div>
 
             <div style={{ padding: 12 }}>
@@ -817,39 +696,22 @@ export default function Page() {
               ) : (
                 <>
                   <div style={{ display: "grid", gap: 6 }}>
-                    <div style={{ fontWeight: 900, fontSize: 16 }}>
-                      {selected.location.toUpperCase()} · {selected.shift}
-                    </div>
-                    <div style={{ opacity: 0.8, fontSize: 13 }}>
-                      {formatWhen(selected.created_at)}
-                    </div>
-
+                    <div style={{ fontWeight: 900, fontSize: 16 }}>{selected.location.toUpperCase()} · {selected.shift}</div>
+                    <div style={{ opacity: 0.8, fontSize: 13 }}>{formatWhen(selected.created_at)}</div>
                     <div style={{ fontWeight: 900, fontSize: 18 }}>{selected.summary}</div>
-
-                    {selected.details ? (
-                      <div style={{ opacity: 0.9, whiteSpace: "pre-wrap" }}>{selected.details}</div>
-                    ) : null}
-
+                    {selected.details ? <div style={{ opacity: 0.9, whiteSpace: "pre-wrap" }}>{selected.details}</div> : null}
                     <div style={{ opacity: 0.8, fontSize: 13 }}>
-                      {selected.priority} · {selected.needs_follow_up ? "FOLLOW-UP" : "—"} ·{" "}
-                      {resolvedIds.has(selected.id) ? "Resolved" : "Open"}
+                      {selected.priority} · {selected.needs_follow_up ? "FOLLOW-UP" : "—"} · {resolvedIds.has(selected.id) ? "Resolved" : "Open"}
                     </div>
                   </div>
 
                   <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
                     {!resolvedIds.has(selected.id) && (
-                      <button
-                        onClick={() => markResolved(selected.id)}
-                        disabled={loading}
-                        style={{ ...btnStyle, flex: 1 }}
-                      >
+                      <button onClick={() => markResolved(selected.id)} disabled={loading} style={{ ...btnStyle, flex: 1 }}>
                         Mark resolved
                       </button>
                     )}
-
-                    <button onClick={closeDrawer} style={{ ...btnStyle, flex: 1, opacity: 0.9 }}>
-                      Back
-                    </button>
+                    <button onClick={closeDrawer} style={{ ...btnStyle, flex: 1, opacity: 0.9 }}>Back</button>
                   </div>
 
                   <hr style={{ margin: "16px 0", opacity: 0.25 }} />
@@ -858,46 +720,20 @@ export default function Page() {
 
                   <div style={{ display: "grid", gap: 10 }}>
                     {updates.map((u) => (
-                      <div
-                        key={u.id}
-                        style={{
-                          borderRadius: 12,
-                          padding: 10,
-                          border: "1px solid rgba(255,255,255,.10)",
-                          opacity: 0.95,
-                        }}
-                      >
-                        <div
-                          style={{
-                            display: "flex",
-                            justifyContent: "space-between",
-                            gap: 10,
-                            fontSize: 12,
-                            opacity: 0.8,
-                          }}
-                        >
-                          <div>
-                            {(u.author_display_name_snapshot ?? "—")} · {u.source}
-                          </div>
+                      <div key={u.id} style={{ borderRadius: 12, padding: 10, border: "1px solid rgba(255,255,255,.10)", opacity: 0.95 }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", gap: 10, fontSize: 12, opacity: 0.8 }}>
+                          <div>{(u.author_display_name_snapshot ?? "—")} · {u.source}</div>
                           <div>{formatWhen(u.created_at)}</div>
                         </div>
                         <div style={{ marginTop: 6, whiteSpace: "pre-wrap" }}>{u.content}</div>
                       </div>
                     ))}
-
                     {updates.length === 0 && <div style={{ opacity: 0.7 }}>No updates yet.</div>}
                   </div>
 
                   <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
-                    <input
-                      placeholder="Add an update (append-only)…"
-                      value={newUpdate}
-                      onChange={(e) => setNewUpdate(e.target.value)}
-                      style={{ ...inputStyle, flex: 1 }}
-                    />
-                    <button onClick={addUpdate} disabled={loading || !newUpdate.trim()} style={btnStyle}>
-                      Add
-                    </button>
+                    <input placeholder="Add an update (append-only)…" value={newUpdate} onChange={(e) => setNewUpdate(e.target.value)} style={{ ...inputStyle, flex: 1 }} />
+                    <button onClick={addUpdate} disabled={loading || !newUpdate.trim()} style={btnStyle}>Add</button>
                   </div>
                 </>
               )}
