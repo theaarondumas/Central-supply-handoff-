@@ -1,7 +1,13 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import { supabase } from "@/lib/supabaseClient";
+import React, { useEffect, useMemo, useState } from "react";
+import { createClient, SupabaseClient } from "@supabase/supabase-js";
+
+/**
+ * Canon schema (append-only):
+ * - public.handoffs: immutable base record
+ * - public.handoff_updates: append-only updates (includes "Marked as resolved")
+ */
 
 type Shift = "AM" | "PM" | "NOC";
 type Priority = "Low" | "Normal" | "High" | "Critical";
@@ -9,510 +15,717 @@ type Priority = "Low" | "Normal" | "High" | "Critical";
 type Handoff = {
   id: string;
   created_at: string;
-  author_name: string | null;
+
+  author_user_id: string;
+  author_display_name_snapshot: string | null;
+
   shift: Shift;
   location: string;
   priority: Priority;
+
   summary: string;
   details: string | null;
+
   needs_follow_up: boolean;
 };
 
-const shifts: Shift[] = ["AM", "PM", "NOC"];
-const priorities: Priority[] = ["Low", "Normal", "High", "Critical"];
+type UpdateSource = "app" | "sms" | "system";
 
-function formatTime(iso: string) {
+type HandoffUpdate = {
+  id: string;
+  created_at: string;
+
+  handoff_id: string;
+  author_user_id: string;
+  author_display_name_snapshot: string | null;
+
+  source: UpdateSource;
+  content: string;
+};
+
+function getSupabase(): SupabaseClient {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
+  if (!url || !key) {
+    throw new Error(
+      "Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY. Check .env.local and restart dev server."
+    );
+  }
+
+  return createClient(url, key, {
+    auth: {
+      persistSession: true,
+      autoRefreshToken: true,
+      detectSessionInUrl: true,
+    },
+  });
+}
+
+function formatWhen(iso: string) {
   const d = new Date(iso);
   return d.toLocaleString(undefined, {
     month: "short",
-    day: "2-digit",
+    day: "numeric",
     hour: "numeric",
     minute: "2-digit",
   });
 }
 
+function errToMsg(err: any) {
+  return (
+    err?.message ||
+    err?.error_description ||
+    err?.hint ||
+    err?.details ||
+    (typeof err === "string" ? err : JSON.stringify(err))
+  );
+}
+
 export default function Page() {
-  // form
-  const [authorName, setAuthorName] = useState("");
-  const [shift, setShift] = useState<Shift>("AM");
-  const [location, setLocation] = useState("Central Supply");
+  const [supabase] = useState(() => getSupabase());
+
+  // Auth
+  const [session, setSession] = useState<any>(null);
+  const [email, setEmail] = useState("");
+  const [sendingLink, setSendingLink] = useState(false);
+
+  // Display name (optional, snapshot)
+  const [displayName, setDisplayName] = useState("JD");
+
+  // Data
+  const [handoffs, setHandoffs] = useState<Handoff[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  // Selection + thread
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [updates, setUpdates] = useState<HandoffUpdate[]>([]);
+  const [newUpdate, setNewUpdate] = useState("");
+
+  // Filters
+  const [followUpOnly, setFollowUpOnly] = useState(false);
+  const [locationFilter, setLocationFilter] = useState("");
+
+  // Create form
+  const [shift, setShift] = useState<Shift>("PM");
+  const [location, setLocation] = useState("ED");
   const [priority, setPriority] = useState<Priority>("Normal");
   const [summary, setSummary] = useState("");
   const [details, setDetails] = useState("");
-  const [needsFollowUp, setNeedsFollowUp] = useState(false);
+  const [needsFollowUp, setNeedsFollowUp] = useState(true);
 
-  // list / filters
-  const [handoffs, setHandoffs] = useState<Handoff[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [filterFollowUpOnly, setFilterFollowUpOnly] = useState(false);
-  const [filterLocation, setFilterLocation] = useState("");
+  // Derived "resolved" (from updates)
+  const [resolvedIds, setResolvedIds] = useState<Set<string>>(new Set());
 
-  // mobile UX
-  const [formOpen, setFormOpen] = useState(true);
-  const [filtersOpen, setFiltersOpen] = useState(false);
+  // ---------------- AUTH WIRING ----------------
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data: sub } = supabase.auth.onAuthStateChange((_evt, s) => setSession(s));
+    return () => sub.subscription.unsubscribe();
+  }, [supabase]);
 
-  const openFollowUps = useMemo(
-    () => handoffs.filter((h) => h.needs_follow_up).length,
-    [handoffs]
-  );
+  async function sendMagicLink() {
+    if (!email.trim()) return;
+    setSendingLink(true);
+    const { error } = await supabase.auth.signInWithOtp({
+      email: email.trim(),
+      options: { emailRedirectTo: window.location.origin },
+    });
+    setSendingLink(false);
+    if (error) alert(errToMsg(error));
+    else alert("Magic link sent. Check your email.");
+  }
 
-  async function fetchHandoffs() {
+  async function signOut() {
+    await supabase.auth.signOut();
+    setSelectedId(null);
+    setUpdates([]);
+    setHandoffs([]);
+  }
+
+  // ---------------- LOADERS ----------------
+  async function loadHandoffs() {
     setLoading(true);
-    const { data, error } = await supabase
-      .from("handoffs")
-      .select("*")
-      // server-side ordering (follow-up first, then newest)
-      .order("needs_follow_up", { ascending: false })
-      .order("created_at", { ascending: false });
+    try {
+      // ✅ Guard: only query when authenticated (RLS)
+      const { data: userRes, error: userErr } = await supabase.auth.getUser();
+      if (userErr) throw userErr;
+      if (!userRes?.user) {
+        setHandoffs([]);
+        setResolvedIds(new Set());
+        return;
+      }
 
-    setLoading(false);
+      const { data, error } = await supabase
+        .from("handoffs")
+        .select("*")
+        .order("needs_follow_up", { ascending: false })
+        .order("priority", { ascending: false })
+        .order("created_at", { ascending: false });
 
-    if (error) {
-      console.error(error);
-      alert(`Error loading handoffs: ${error.message}`);
+      if (error) throw error;
+
+      const rows = ((data ?? []) as Handoff[]).map((h) => ({
+        ...h,
+        author_display_name_snapshot: h.author_display_name_snapshot ?? null,
+        details: h.details ?? null,
+      }));
+
+      setHandoffs(rows);
+
+      // ✅ derive resolved from append-only updates
+      await loadResolvedIndex(rows.map((r) => r.id));
+    } catch (err: any) {
+      console.error("LoadHandoffs FULL error:", err);
+      alert("Error loading handoffs:\n" + errToMsg(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadUpdates(handoffId: string) {
+    setLoading(true);
+    try {
+      const { data: userRes, error: userErr } = await supabase.auth.getUser();
+      if (userErr) throw userErr;
+      if (!userRes?.user) {
+        setUpdates([]);
+        return;
+      }
+
+      const { data, error } = await supabase
+        .from("handoff_updates")
+        .select("*")
+        .eq("handoff_id", handoffId)
+        .order("created_at", { ascending: true });
+
+      if (error) throw error;
+      setUpdates((data ?? []) as HandoffUpdate[]);
+    } catch (err: any) {
+      console.error("LoadUpdates FULL error:", err);
+      alert("Error loading updates:\n" + errToMsg(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // Pull recent "Marked as resolved" events and build a Set of resolved handoff_ids
+  async function loadResolvedIndex(handoffIds: string[]) {
+    if (handoffIds.length === 0) {
+      setResolvedIds(new Set());
       return;
     }
 
-    setHandoffs((data ?? []) as Handoff[]);
+    // Keep it light: only fetch system events for these handoffs
+    const { data, error } = await supabase
+      .from("handoff_updates")
+      .select("handoff_id, created_at, content, source")
+      .in("handoff_id", handoffIds)
+      .eq("source", "system")
+      .ilike("content", "Marked as resolved%")
+      .order("created_at", { ascending: false })
+      .limit(500);
+
+    if (error) {
+      console.warn("Resolved index load warning:", error);
+      setResolvedIds(new Set());
+      return;
+    }
+
+    const s = new Set<string>();
+    (data ?? []).forEach((r: any) => {
+      if (r?.handoff_id) s.add(r.handoff_id);
+    });
+    setResolvedIds(s);
   }
+
+  // ---------------- ACTIONS ----------------
+  async function createHandoff() {
+    if (!summary.trim()) {
+      alert("Summary is required.");
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const { data: userRes, error: userErr } = await supabase.auth.getUser();
+      if (userErr) throw userErr;
+      const user = userRes?.user;
+      if (!user) {
+        alert("Please sign in first.");
+        return;
+      }
+
+      const payload = {
+        author_user_id: user.id,
+        author_display_name_snapshot: displayName?.trim() || null,
+
+        shift,
+        location: location.trim(),
+        priority,
+
+        summary: summary.trim(),
+        details: details.trim() || null,
+        needs_follow_up: !!needsFollowUp,
+      };
+
+      const { error } = await supabase.from("handoffs").insert(payload);
+      if (error) throw error;
+
+      setSummary("");
+      setDetails("");
+      await loadHandoffs();
+    } catch (err: any) {
+      console.error("Insert error:", err);
+      alert("Error saving handoff:\n" + errToMsg(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // ✅ Append-only "resolve": insert an update event (NO updates to handoffs)
+  async function markResolved(handoffId: string) {
+    setLoading(true);
+    try {
+      const { data: userRes, error: userErr } = await supabase.auth.getUser();
+      if (userErr) throw userErr;
+      const user = userRes?.user;
+      if (!user) {
+        alert("Please sign in first.");
+        return;
+      }
+
+      const { error } = await supabase.from("handoff_updates").insert({
+        handoff_id: handoffId,
+        author_user_id: user.id,
+        author_display_name_snapshot: displayName?.trim() || null,
+        source: "system",
+        content: "Marked as resolved",
+      });
+
+      if (error) throw error;
+
+      // Refresh
+      await loadHandoffs();
+      if (selectedId === handoffId) await loadUpdates(handoffId);
+    } catch (err: any) {
+      console.error("Resolve error:", err);
+      alert("Error marking resolved:\n" + errToMsg(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // ✅ Append-only user update
+  async function addUpdate() {
+    if (!selectedId) {
+      alert("Select a handoff first.");
+      return;
+    }
+    if (!newUpdate.trim()) return;
+
+    setLoading(true);
+    try {
+      const { data: userRes, error: userErr } = await supabase.auth.getUser();
+      if (userErr) throw userErr;
+      const user = userRes?.user;
+      if (!user) {
+        alert("Please sign in first.");
+        return;
+      }
+
+      const { error } = await supabase.from("handoff_updates").insert({
+        handoff_id: selectedId,
+        author_user_id: user.id,
+        author_display_name_snapshot: displayName?.trim() || null,
+        source: "app",
+        content: newUpdate.trim(),
+      });
+
+      if (error) throw error;
+
+      setNewUpdate("");
+      await loadUpdates(selectedId);
+    } catch (err: any) {
+      console.error("Add update error:", err);
+      alert("Error adding update:\n" + errToMsg(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // ❌ No delete in append-only model
+  async function deleteHandoffBlocked() {
+    alert("Delete is disabled. This system is append-only (audit-safe).");
+  }
+
+  // ---------------- EFFECTS ----------------
+  useEffect(() => {
+    // Load only after session exists (RLS)
+    if (session) loadHandoffs();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session]);
 
   useEffect(() => {
-    fetchHandoffs();
+    if (selectedId) loadUpdates(selectedId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [selectedId]);
 
-  // Client-side filters (sorting already handled server-side)
+  // ---------------- DERIVED UI ----------------
+  const totalCount = handoffs.length;
+
   const filtered = useMemo(() => {
+    const locQ = locationFilter.trim().toLowerCase();
+
     return handoffs.filter((h) => {
-      if (filterFollowUpOnly && !h.needs_follow_up) return false;
-      if (
-        filterLocation.trim() &&
-        !h.location.toLowerCase().includes(filterLocation.trim().toLowerCase())
-      )
-        return false;
+      const isResolved = resolvedIds.has(h.id);
+
+      // Follow-up only = unresolved + needs follow-up (action queue)
+      if (followUpOnly) {
+        if (isResolved) return false;
+        if (!h.needs_follow_up) return false;
+      }
+
+      if (locQ) {
+        const loc = (h.location || "").toLowerCase();
+        if (!loc.includes(locQ)) return false;
+      }
+
       return true;
     });
-  }, [handoffs, filterFollowUpOnly, filterLocation]);
+  }, [handoffs, followUpOnly, locationFilter, resolvedIds]);
 
-  async function addHandoff() {
-    if (!summary.trim()) return alert("Summary is required.");
-    if (!location.trim()) return alert("Location is required.");
+  const selected = useMemo(
+    () => (selectedId ? handoffs.find((h) => h.id === selectedId) ?? null : null),
+    [handoffs, selectedId]
+  );
 
-    setLoading(true);
-
-    const payload = {
-      author_name: authorName.trim() || null,
-      shift,
-      location: location.trim(),
-      priority,
-      summary: summary.trim(),
-      details: details.trim() || null,
-      needs_follow_up: needsFollowUp,
-    };
-
-    const { error } = await supabase.from("handoffs").insert(payload);
-
-    setLoading(false);
-
-    if (error) {
-      console.error(error);
-      alert(`Error saving handoff: ${error.message}`);
-      return;
-    }
-
-    // reset
-    setSummary("");
-    setDetails("");
-    setNeedsFollowUp(false);
-    setPriority("Normal");
-
-    await fetchHandoffs();
-    setFormOpen(false);
-
-    alert("Handoff saved ✅ (Supabase)");
-  }
-
-  async function toggleFollowUp(id: string, current: boolean) {
-    setLoading(true);
-
-    const { error } = await supabase
-      .from("handoffs")
-      .update({ needs_follow_up: !current })
-      .eq("id", id);
-
-    setLoading(false);
-
-    if (error) {
-      console.error(error);
-      alert(`Error updating follow-up: ${error.message}`);
-      return;
-    }
-
-    await fetchHandoffs();
-  }
-
-  async function removeHandoff(id: string) {
-    if (!confirm("Delete this handoff?")) return;
-
-    setLoading(true);
-    const { error } = await supabase.from("handoffs").delete().eq("id", id);
-    setLoading(false);
-
-    if (error) {
-      console.error(error);
-      alert(`Error deleting handoff: ${error.message}`);
-      return;
-    }
-
-    await fetchHandoffs();
-  }
-
-  async function clearAll() {
-    if (!confirm("Clear ALL handoffs from the database?")) return;
-
-    setLoading(true);
-    // delete all rows (safe hack condition)
-    const { error } = await supabase
-      .from("handoffs")
-      .delete()
-      .neq("id", "00000000-0000-0000-0000-000000000000");
-    setLoading(false);
-
-    if (error) {
-      console.error(error);
-      alert(`Error clearing handoffs: ${error.message}`);
-      return;
-    }
-
-    await fetchHandoffs();
-  }
-
-  const pillPriority = (p: Priority) =>
-    `rounded-full border px-2 py-1 text-xs ${
-      p === "Critical"
-        ? "border-red-700 text-red-200"
-        : p === "High"
-        ? "border-amber-600 text-amber-200"
-        : p === "Normal"
-        ? "border-zinc-700 text-zinc-200"
-        : "border-zinc-700 text-zinc-300"
-    }`;
-
-  const borderPriority = (p: Priority) =>
-    p === "Critical"
-      ? "border-red-700"
-      : p === "High"
-      ? "border-amber-600"
-      : p === "Normal"
-      ? "border-zinc-800"
-      : "border-zinc-700";
-
-  return (
-    <main className="min-h-screen bg-zinc-950 text-zinc-50">
-      <div className="mx-auto max-w-4xl px-4 pb-24 pt-6 sm:px-6 sm:pb-10 sm:pt-10">
-        <header className="mb-4 sm:mb-8">
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
-            <div>
-              <h1 className="text-2xl font-bold tracking-tight sm:text-4xl">
-                Central Supply Handoff
-              </h1>
-              <p className="mt-1 text-sm text-zinc-400 sm:mt-2 sm:text-base">
-                Shift-to-shift handoff log (Supabase source of truth).
-              </p>
-            </div>
-
-            <div className="flex items-center gap-2">
-              <span className="rounded-full border border-zinc-800 px-2 py-1 text-xs text-zinc-200">
-                Open follow-ups:{" "}
-                <span className="font-semibold">{openFollowUps}</span>
-              </span>
-
-              <button
-                onClick={fetchHandoffs}
-                type="button"
-                className="rounded-lg border border-zinc-700 px-3 py-2 text-xs text-zinc-200 hover:bg-zinc-800"
-              >
-                Refresh
-              </button>
-            </div>
-          </div>
-
-          <div className="mt-3 flex flex-wrap gap-2 sm:hidden">
-            <button
-              type="button"
-              onClick={() => setFormOpen((v) => !v)}
-              className="rounded-lg border border-zinc-800 bg-zinc-900/40 px-3 py-2 text-xs text-zinc-200"
-            >
-              {formOpen ? "Hide form" : "New handoff"}
-            </button>
-            <button
-              type="button"
-              onClick={() => setFiltersOpen((v) => !v)}
-              className="rounded-lg border border-zinc-800 bg-zinc-900/40 px-3 py-2 text-xs text-zinc-200"
-            >
-              {filtersOpen ? "Hide filters" : "Filters"}
-            </button>
-            <button
-              type="button"
-              onClick={clearAll}
-              className="rounded-lg border border-zinc-800 bg-zinc-900/40 px-3 py-2 text-xs text-zinc-200"
-            >
-              Clear all
-            </button>
-          </div>
+  // ---------------- AUTH GATE ----------------
+  if (!session) {
+    return (
+      <div style={{ maxWidth: 560, margin: "0 auto", padding: 20 }}>
+        <header style={{ marginBottom: 16 }}>
+          <h1 style={{ fontSize: 34, fontWeight: 800, margin: 0 }}>Central Supply Handoff</h1>
+          <p style={{ marginTop: 6, opacity: 0.75 }}>
+            Sign in with a magic link (required for RLS).
+          </p>
         </header>
 
-        {formOpen && (
-          <section className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-4 sm:p-5">
-            <div className="mb-3 flex items-baseline justify-between gap-3">
-              <h2 className="text-base font-semibold sm:text-lg">Create handoff</h2>
-              <span className="text-xs text-zinc-500 sm:hidden">Tap submit below</span>
-            </div>
-
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-              <label className="grid gap-1">
-                <span className="text-xs text-zinc-400">Your name (optional)</span>
-                <input
-                  value={authorName}
-                  onChange={(e) => setAuthorName(e.target.value)}
-                  placeholder="Aaron"
-                  className="h-11 rounded-xl border border-zinc-800 bg-zinc-950 px-3 outline-none focus:border-zinc-600"
-                />
-              </label>
-
-              <label className="grid gap-1">
-                <span className="text-xs text-zinc-400">Shift</span>
-                <select
-                  value={shift}
-                  onChange={(e) => setShift(e.target.value as Shift)}
-                  className="h-11 rounded-xl border border-zinc-800 bg-zinc-950 px-3 outline-none focus:border-zinc-600"
-                >
-                  {shifts.map((s) => (
-                    <option key={s} value={s}>
-                      {s}
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <label className="grid gap-1">
-                <span className="text-xs text-zinc-400">Location</span>
-                <input
-                  value={location}
-                  onChange={(e) => setLocation(e.target.value)}
-                  placeholder="ED / OR / SPD / Central Supply"
-                  className="h-11 rounded-xl border border-zinc-800 bg-zinc-950 px-3 outline-none focus:border-zinc-600"
-                />
-              </label>
-
-              <label className="grid gap-1">
-                <span className="text-xs text-zinc-400">Priority</span>
-                <select
-                  value={priority}
-                  onChange={(e) => setPriority(e.target.value as Priority)}
-                  className="h-11 rounded-xl border border-zinc-800 bg-zinc-950 px-3 outline-none focus:border-zinc-600"
-                >
-                  {priorities.map((p) => (
-                    <option key={p} value={p}>
-                      {p}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            </div>
-
-            <div className="mt-3 grid gap-3">
-              <label className="grid gap-1">
-                <span className="text-xs text-zinc-400">Summary (required)</span>
-                <input
-                  value={summary}
-                  onChange={(e) => setSummary(e.target.value)}
-                  placeholder="e.g., Crash cart seal broken in ED; restock needed"
-                  className="h-11 rounded-xl border border-zinc-800 bg-zinc-950 px-3 outline-none focus:border-zinc-600"
-                />
-              </label>
-
-              <label className="grid gap-1">
-                <span className="text-xs text-zinc-400">Details (optional)</span>
-                <textarea
-                  value={details}
-                  onChange={(e) => setDetails(e.target.value)}
-                  placeholder="What happened, what was done, what needs follow-up, where items are located, who was notified..."
-                  rows={4}
-                  className="rounded-xl border border-zinc-800 bg-zinc-950 px-3 py-2 outline-none focus:border-zinc-600"
-                />
-              </label>
-
-              <label className="flex items-center gap-2 text-sm text-zinc-200">
-                <input
-                  type="checkbox"
-                  checked={needsFollowUp}
-                  onChange={(e) => setNeedsFollowUp(e.target.checked)}
-                />
-                Needs follow-up
-              </label>
-
-              <div className="hidden sm:block">
-                <button
-                  onClick={addHandoff}
-                  type="button"
-                  className="h-12 w-full rounded-xl bg-zinc-50 px-4 font-semibold text-zinc-950 hover:bg-zinc-200 disabled:opacity-50"
-                  disabled={loading}
-                >
-                  {loading ? "Loading…" : "Submit handoff"}
-                </button>
-              </div>
-            </div>
-          </section>
-        )}
-
-        <section className="mt-4 rounded-2xl border border-zinc-800 bg-zinc-900/20 p-3 sm:mt-6 sm:border-0 sm:bg-transparent sm:p-0">
-          <div className="hidden sm:flex sm:flex-wrap sm:items-center sm:gap-3">
-            <label className="flex items-center gap-2 text-sm text-zinc-200">
-              <input
-                type="checkbox"
-                checked={filterFollowUpOnly}
-                onChange={(e) => setFilterFollowUpOnly(e.target.checked)}
-              />
-              Follow-up only
-            </label>
-
-            <input
-              value={filterLocation}
-              onChange={(e) => setFilterLocation(e.target.value)}
-              placeholder="Filter location…"
-              className="h-11 w-56 rounded-xl border border-zinc-800 bg-zinc-950 px-3 text-sm outline-none focus:border-zinc-600"
-            />
-
-            <div className="text-sm text-zinc-400">
-              Showing <span className="font-semibold text-zinc-200">{filtered.length}</span> /{" "}
-              {handoffs.length}
-            </div>
-          </div>
-
-          {filtersOpen && (
-            <div className="grid gap-3 sm:hidden">
-              <label className="flex items-center gap-2 text-sm text-zinc-200">
-                <input
-                  type="checkbox"
-                  checked={filterFollowUpOnly}
-                  onChange={(e) => setFilterFollowUpOnly(e.target.checked)}
-                />
-                Follow-up only
-              </label>
-
-              <input
-                value={filterLocation}
-                onChange={(e) => setFilterLocation(e.target.value)}
-                placeholder="Filter location…"
-                className="h-11 w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3 text-sm outline-none focus:border-zinc-600"
-              />
-            </div>
-          )}
-        </section>
-
-        <section className="mt-4 grid gap-3">
-          {loading ? (
-            <div className="rounded-2xl border border-zinc-800 bg-zinc-900/30 p-5 text-zinc-400">
-              Loading…
-            </div>
-          ) : filtered.length === 0 ? (
-            <div className="rounded-2xl border border-zinc-800 bg-zinc-900/30 p-5 text-zinc-400">
-              No handoffs yet.
-            </div>
-          ) : (
-            filtered.map((h) => (
-              <article
-                key={h.id}
-                className={`rounded-2xl border p-4 sm:p-5 ${
-                  h.needs_follow_up ? "bg-zinc-900/70" : "bg-zinc-900/30"
-                } ${borderPriority(h.priority)}`}
-              >
-                <div className="flex flex-col gap-2 sm:flex-row sm:items-baseline sm:justify-between">
-                  <div className="flex flex-wrap items-baseline gap-2">
-                    <div className="text-base font-semibold sm:text-lg">{h.location}</div>
-                    <div className="text-xs text-zinc-400 sm:text-sm">
-                      {h.shift} • {formatTime(h.created_at)} • by {h.author_name ?? "—"}
-                    </div>
-                  </div>
-
-                  <div className="flex items-center gap-2">
-                    <span className={pillPriority(h.priority)}>{h.priority}</span>
-                    {h.needs_follow_up ? (
-                      <span className="rounded-full border border-zinc-700 px-2 py-1 text-xs text-zinc-200">
-                        Follow-up
-                      </span>
-                    ) : (
-                      <span className="rounded-full border border-zinc-800 px-2 py-1 text-xs text-zinc-400">
-                        Resolved
-                      </span>
-                    )}
-                  </div>
-                </div>
-
-                <div className="mt-2 text-lg font-semibold sm:text-xl">{h.summary}</div>
-                {h.details ? (
-                  <div className="mt-2 whitespace-pre-wrap text-sm text-zinc-200/90 sm:text-base">
-                    {h.details}
-                  </div>
-                ) : null}
-
-                <div className="mt-4 grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:gap-2">
-                  <button
-                    onClick={() => toggleFollowUp(h.id, h.needs_follow_up)}
-                    type="button"
-                    className="h-11 rounded-lg border border-zinc-700 px-3 text-sm text-zinc-200 hover:bg-zinc-800"
-                  >
-                    {h.needs_follow_up ? "Mark resolved" : "Mark needs follow-up"}
-                  </button>
-
-                  <button
-                    onClick={() => removeHandoff(h.id)}
-                    type="button"
-                    className="h-11 rounded-lg border border-zinc-800 px-3 text-sm text-zinc-400 hover:bg-zinc-900"
-                  >
-                    Delete
-                  </button>
-                </div>
-              </article>
-            ))
-          )}
-        </section>
-
-        <footer className="mt-8 text-xs text-zinc-500">
-          Supabase is the source of truth ✅ (Read + Write). Follow-ups auto-surface first.
-        </footer>
-      </div>
-
-      {/* Mobile sticky action bar */}
-      <div className="fixed inset-x-0 bottom-0 z-50 border-t border-zinc-800 bg-zinc-950/95 backdrop-blur sm:hidden">
-        <div className="mx-auto flex max-w-4xl items-center gap-2 px-4 py-3">
-          <button
-            type="button"
-            onClick={() => setFormOpen(true)}
-            className="h-12 rounded-xl border border-zinc-800 bg-zinc-900/40 px-3 text-xs text-zinc-200"
-          >
-            New
-          </button>
+        <div
+          style={{
+            border: "1px solid rgba(255,255,255,.12)",
+            borderRadius: 16,
+            padding: 16,
+          }}
+        >
+          <input
+            placeholder="your@email.com"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            style={{ ...inputStyle, width: "100%" }}
+          />
 
           <button
-            onClick={addHandoff}
-            type="button"
-            className="h-12 flex-1 rounded-xl bg-zinc-50 px-4 font-semibold text-zinc-950 disabled:opacity-50"
-            disabled={loading || !summary.trim() || !location.trim()}
+            onClick={sendMagicLink}
+            disabled={sendingLink || !email.trim()}
+            style={{ ...btnStyle, width: "100%", marginTop: 12 }}
           >
-            {loading ? "Loading…" : "Submit handoff"}
+            {sendingLink ? "Sending…" : "Send magic link"}
           </button>
 
-          <button
-            type="button"
-            onClick={fetchHandoffs}
-            className="h-12 rounded-xl border border-zinc-800 bg-zinc-900/40 px-3 text-xs text-zinc-200"
-          >
-            Sync
-          </button>
+          <p style={{ marginTop: 10, opacity: 0.7, fontSize: 13 }}>
+            After you click the email link, you’ll come back here signed in.
+          </p>
         </div>
       </div>
-    </main>
+    );
+  }
+
+  // ---------------- MAIN UI ----------------
+  return (
+    <div style={{ maxWidth: 1100, margin: "0 auto", padding: 20 }}>
+      <header style={{ marginBottom: 16 }}>
+        <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+          <div>
+            <h1 style={{ fontSize: 34, fontWeight: 800, margin: 0 }}>Central Supply Handoff</h1>
+            <p style={{ marginTop: 6, opacity: 0.75 }}>
+              Append-only handoff log (Supabase system of record).
+            </p>
+          </div>
+
+          <div style={{ marginLeft: "auto", display: "flex", gap: 10, alignItems: "center" }}>
+            <input
+              placeholder="Display name (optional)"
+              value={displayName}
+              onChange={(e) => setDisplayName(e.target.value)}
+              style={{ ...inputStyle, minWidth: 200 }}
+            />
+            <button onClick={signOut} style={btnStyle}>
+              Sign out
+            </button>
+          </div>
+        </div>
+      </header>
+
+      {/* Filters */}
+      <div
+        style={{
+          display: "flex",
+          gap: 12,
+          alignItems: "center",
+          flexWrap: "wrap",
+          marginBottom: 16,
+        }}
+      >
+        <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <input
+            type="checkbox"
+            checked={followUpOnly}
+            onChange={(e) => setFollowUpOnly(e.target.checked)}
+          />
+          Follow-up only
+        </label>
+
+        <input
+          placeholder="Filter location…"
+          value={locationFilter}
+          onChange={(e) => setLocationFilter(e.target.value)}
+          style={{
+            ...inputStyle,
+            minWidth: 220,
+          }}
+        />
+
+        <div style={{ marginLeft: "auto", opacity: 0.8 }}>
+          Showing <b>{filtered.length}</b> / <b>{totalCount}</b>
+        </div>
+
+        <button onClick={loadHandoffs} disabled={loading} style={btnStyle}>
+          {loading ? "Loading…" : "Refresh"}
+        </button>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+        {/* Create handoff */}
+        <section
+          style={{
+            border: "1px solid rgba(255,255,255,.12)",
+            borderRadius: 16,
+            padding: 16,
+            marginBottom: 18,
+          }}
+        >
+          <h2 style={{ margin: 0, marginBottom: 12, fontSize: 18 }}>Create handoff</h2>
+
+          <div style={{ display: "grid", gap: 10, gridTemplateColumns: "1fr 1fr 1fr 1fr" }}>
+            <select value={shift} onChange={(e) => setShift(e.target.value as Shift)} style={inputStyle}>
+              <option value="AM">AM</option>
+              <option value="PM">PM</option>
+              <option value="NOC">NOC</option>
+            </select>
+
+            <input
+              placeholder="Location"
+              value={location}
+              onChange={(e) => setLocation(e.target.value)}
+              style={inputStyle}
+            />
+
+            <select value={priority} onChange={(e) => setPriority(e.target.value as Priority)} style={inputStyle}>
+              <option value="Normal">Normal</option>
+              <option value="High">High</option>
+              <option value="Critical">Critical</option>
+              <option value="Low">Low</option>
+            </select>
+
+            <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <input
+                type="checkbox"
+                checked={needsFollowUp}
+                onChange={(e) => setNeedsFollowUp(e.target.checked)}
+              />
+              Follow-up
+            </label>
+          </div>
+
+          <div style={{ marginTop: 10 }}>
+            <input
+              placeholder="Summary (required)"
+              value={summary}
+              onChange={(e) => setSummary(e.target.value)}
+              style={{ ...inputStyle, width: "100%" }}
+            />
+          </div>
+
+          <div style={{ marginTop: 10 }}>
+            <textarea
+              placeholder="Details (optional)…"
+              value={details}
+              onChange={(e) => setDetails(e.target.value)}
+              rows={4}
+              style={{ ...inputStyle, width: "100%", resize: "vertical" }}
+            />
+          </div>
+
+          <button
+            onClick={createHandoff}
+            disabled={loading}
+            style={{ ...btnStyle, width: "100%", marginTop: 12, fontWeight: 800 }}
+          >
+            {loading ? "Saving…" : "Save handoff"}
+          </button>
+
+          <p style={{ marginTop: 10, opacity: 0.7, fontSize: 13 }}>
+            Note: This log is append-only. No edits, no deletes—only new entries and updates.
+          </p>
+        </section>
+
+        {/* Thread / updates */}
+        <section
+          style={{
+            border: "1px solid rgba(255,255,255,.12)",
+            borderRadius: 16,
+            padding: 16,
+            marginBottom: 18,
+          }}
+        >
+          <h2 style={{ margin: 0, marginBottom: 12, fontSize: 18 }}>Updates</h2>
+
+          {!selected ? (
+            <div style={{ opacity: 0.7 }}>Select a handoff from the list to view or add updates.</div>
+          ) : (
+            <>
+              <div style={{ display: "grid", gap: 6 }}>
+                <div style={{ fontWeight: 900 }}>{selected.location.toUpperCase()}</div>
+                <div style={{ opacity: 0.8 }}>
+                  {selected.shift} · {formatWhen(selected.created_at)} ·{" "}
+                  {selected.author_display_name_snapshot ? `by ${selected.author_display_name_snapshot}` : ""}
+                </div>
+                <div style={{ fontWeight: 900 }}>{selected.summary}</div>
+                {selected.details ? <div style={{ opacity: 0.9, whiteSpace: "pre-wrap" }}>{selected.details}</div> : null}
+                <div style={{ opacity: 0.8 }}>
+                  {selected.priority} · {selected.needs_follow_up ? "FOLLOW-UP" : "—"} ·{" "}
+                  {resolvedIds.has(selected.id) ? "Resolved" : "Open"}
+                </div>
+              </div>
+
+              <div style={{ marginTop: 12, display: "flex", gap: 10 }}>
+                {!resolvedIds.has(selected.id) && (
+                  <button onClick={() => markResolved(selected.id)} disabled={loading} style={btnStyle}>
+                    Mark resolved
+                  </button>
+                )} 
+              </div>
+
+              <hr style={{ margin: "16px 0", opacity: 0.25 }} />
+
+              <div style={{ display: "grid", gap: 10 }}>
+                {updates.map((u) => (
+                  <div
+                    key={u.id}
+                    style={{
+                      borderRadius: 12,
+                      padding: 10,
+                      border: "1px solid rgba(255,255,255,.10)",
+                      opacity: 0.95,
+                    }}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 10, fontSize: 12, opacity: 0.8 }}>
+                      <div>
+                        {(u.author_display_name_snapshot ?? "—")} · {u.source}
+                      </div>
+                      <div>{formatWhen(u.created_at)}</div>
+                    </div>
+                    <div style={{ marginTop: 6, whiteSpace: "pre-wrap" }}>{u.content}</div>
+                  </div>
+                ))}
+
+                {updates.length === 0 && <div style={{ opacity: 0.7 }}>No updates yet.</div>}
+              </div>
+
+              <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+                <input
+                  placeholder="Add an update (append-only)…"
+                  value={newUpdate}
+                  onChange={(e) => setNewUpdate(e.target.value)}
+                  style={{ ...inputStyle, flex: 1 }}
+                />
+                <button onClick={addUpdate} disabled={loading || !newUpdate.trim()} style={btnStyle}>
+                  Add
+                </button>
+              </div>
+            </>
+          )}
+        </section>
+      </div>
+
+      {/* List */}
+      <section style={{ display: "grid", gap: 12 }}>
+        {filtered.map((h) => {
+          const isResolved = resolvedIds.has(h.id);
+
+          return (
+            <button
+              key={h.id}
+              onClick={() => setSelectedId(h.id)}
+              style={{
+                textAlign: "left",
+                width: "100%",
+                borderRadius: 16,
+                padding: 14,
+                border: `1px solid ${isResolved ? "rgba(255,255,255,.10)" : "rgba(255,165,0,.35)"}`,
+                opacity: isResolved ? 0.65 : 1,
+                background: "transparent",
+                cursor: "pointer",
+              }}
+            >
+              <div style={{ display: "flex", gap: 10, alignItems: "baseline", flexWrap: "wrap" }}>
+                <div style={{ fontWeight: 900, letterSpacing: 0.3 }}>{h.location.toUpperCase()}</div>
+
+                <div style={{ opacity: 0.8 }}>
+                  {h.shift} · {formatWhen(h.created_at)}
+                  {h.author_display_name_snapshot ? ` · by ${h.author_display_name_snapshot}` : ""}
+                </div>
+
+                <div style={{ marginLeft: "auto", opacity: 0.8 }}>
+                  {h.priority}
+                  {isResolved ? " · Resolved" : ""}
+                  {h.needs_follow_up ? " · FOLLOW-UP" : ""}
+                </div>
+              </div>
+
+              <div style={{ marginTop: 8, fontSize: 18, fontWeight: 900 }}>
+                {h.summary.toUpperCase()}
+              </div>
+
+              {h.details ? (
+                <div style={{ marginTop: 6, opacity: 0.9, whiteSpace: "pre-wrap" }}>{h.details}</div>
+              ) : null}
+            </button>
+          );
+        })}
+
+        {!loading && filtered.length === 0 && (
+          <div style={{ opacity: 0.7, padding: 12 }}>No handoffs match your filters.</div>
+        )}
+      </section>
+    </div>
   );
 }
+
+const inputStyle: React.CSSProperties = {
+  padding: "10px 12px",
+  borderRadius: 12,
+  border: "1px solid rgba(255,255,255,.15)",
+  background: "transparent",
+  outline: "none",
+};
+
+const btnStyle: React.CSSProperties = {
+  padding: "10px 12px",
+  borderRadius: 12,
+  border: "1px solid rgba(255,255,255,.15)",
+  background: "transparent",
+  cursor: "pointer",
+  fontWeight: 700,
+};
