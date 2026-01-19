@@ -3,21 +3,14 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 
-/**
- * Canon schema (append-only):
- * - public.handoffs: immutable base record
- * - public.handoff_updates: append-only updates (includes "Marked as resolved")
- */
-
 type Shift = "AM" | "PM" | "NOC";
 type Priority = "Low" | "Normal" | "High" | "Critical";
 
+// NOTE: Your DB handoffs table does NOT have author_user_id or author_display_name_snapshot.
+// Keep this type aligned with your actual handoffs columns.
 type Handoff = {
   id: string;
   created_at: string;
-
-  author_user_id: string;
-  author_display_name_snapshot: string | null;
 
   shift: Shift;
   location: string;
@@ -31,11 +24,13 @@ type Handoff = {
 
 type UpdateSource = "app" | "sms" | "system";
 
+// NOTE: Your handoff_updates table DOES have author_user_id + author_display_name_snapshot.
 type HandoffUpdate = {
   id: string;
   created_at: string;
 
   handoff_id: string;
+
   author_user_id: string;
   author_display_name_snapshot: string | null;
 
@@ -90,7 +85,7 @@ export default function Page() {
   const [email, setEmail] = useState("");
   const [sendingLink, setSendingLink] = useState(false);
 
-  // Display name (optional, snapshot)
+  // Optional display name snapshot (used ONLY when writing handoff_updates)
   const [displayName, setDisplayName] = useState("JD");
 
   // Data
@@ -128,7 +123,7 @@ export default function Page() {
     return () => mq.removeEventListener?.("change", apply);
   }, []);
 
-  // ✅ MOBILE DRAWER STATE
+  // ✅ MOBILE DRAWER
   const [drawerOpen, setDrawerOpen] = useState(false);
   function openDrawerFor(id: string) {
     setSelectedId(id);
@@ -138,7 +133,7 @@ export default function Page() {
     setDrawerOpen(false);
   }
 
-  // ---------------- AUTH WIRING ----------------
+  // ---------------- AUTH ----------------
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session));
     const { data: sub } = supabase.auth.onAuthStateChange((_evt, s) => setSession(s));
@@ -186,9 +181,9 @@ export default function Page() {
 
       if (error) throw error;
 
+      // Make sure nullables are normalized
       const rows = ((data ?? []) as Handoff[]).map((h) => ({
         ...h,
-        author_display_name_snapshot: h.author_display_name_snapshot ?? null,
         details: h.details ?? null,
       }));
 
@@ -219,6 +214,7 @@ export default function Page() {
         .order("created_at", { ascending: true });
 
       if (error) throw error;
+
       setUpdates((data ?? []) as HandoffUpdate[]);
     } catch (err: any) {
       console.error("LoadUpdates FULL error:", err);
@@ -236,11 +232,10 @@ export default function Page() {
 
     const { data, error } = await supabase
       .from("handoff_updates")
-      .select("handoff_id, created_at, content, source")
+      .select("handoff_id, content, source")
       .in("handoff_id", handoffIds)
       .eq("source", "system")
       .ilike("content", "Marked as resolved%")
-      .order("created_at", { ascending: false })
       .limit(500);
 
     if (error) {
@@ -257,6 +252,8 @@ export default function Page() {
   }
 
   // ---------------- ACTIONS ----------------
+
+  // ✅ IMPORTANT: no author_user_id / author_display_name_snapshot in handoffs insert
   async function createHandoff() {
     if (!summary.trim()) {
       alert("Summary is required.");
@@ -274,8 +271,6 @@ export default function Page() {
       }
 
       const payload = {
-        author_user_id: user.id,
-        
         shift,
         location: location.trim(),
         priority,
@@ -290,6 +285,7 @@ export default function Page() {
 
       setSummary("");
       setDetails("");
+
       await loadHandoffs();
     } catch (err: any) {
       console.error("Insert error:", err);
@@ -299,6 +295,7 @@ export default function Page() {
     }
   }
 
+  // ✅ Resolve is append-only via handoff_updates (auth fields live here)
   async function markResolved(handoffId: string) {
     setLoading(true);
     try {
@@ -330,6 +327,7 @@ export default function Page() {
     }
   }
 
+  // ✅ Append-only update via handoff_updates
   async function addUpdate() {
     if (!selectedId) {
       alert("Select a handoff first.");
@@ -532,7 +530,7 @@ export default function Page() {
         </button>
       </div>
 
-      {/* Desktop only: Create + Updates side by side */}
+      {/* Create + Updates (desktop panel only) */}
       <div
         style={{
           display: "grid",
@@ -639,8 +637,7 @@ export default function Page() {
                 <div style={{ display: "grid", gap: 6 }}>
                   <div style={{ fontWeight: 900 }}>{selected.location.toUpperCase()}</div>
                   <div style={{ opacity: 0.8 }}>
-                    {selected.shift} · {formatWhen(selected.created_at)} ·{" "}
-                    {selected.author_display_name_snapshot ? `by ${selected.author_display_name_snapshot}` : ""}
+                    {selected.shift} · {formatWhen(selected.created_at)}
                   </div>
                   <div style={{ fontWeight: 900 }}>{selected.summary}</div>
                   {selected.details ? (
@@ -736,7 +733,6 @@ export default function Page() {
 
                 <div style={{ opacity: 0.8 }}>
                   {h.shift} · {formatWhen(h.created_at)}
-                  {h.author_display_name_snapshot ? ` · by ${h.author_display_name_snapshot}` : ""}
                 </div>
 
                 <div style={{ marginLeft: "auto", opacity: 0.8 }}>
@@ -826,9 +822,6 @@ export default function Page() {
                     </div>
                     <div style={{ opacity: 0.8, fontSize: 13 }}>
                       {formatWhen(selected.created_at)}
-                      {selected.author_display_name_snapshot
-                        ? ` · by ${selected.author_display_name_snapshot}`
-                        : ""}
                     </div>
 
                     <div style={{ fontWeight: 900, fontSize: 18 }}>{selected.summary}</div>
