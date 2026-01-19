@@ -1,7 +1,19 @@
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
+
+/**
+ * v3.1 locked:
+ * - BUILD_TAG shown in UI to confirm mobile is on latest deploy
+ * - Sticky "+ Create handoff" (scroll + fixed for iOS reliability)
+ * - Priority signal via BOX GLOW (boxShadow), border stays neutral
+ * - Critical floats to top via client-side rank sort
+ * - Mobile drawer for details + updates
+ * - Ignore AbortError (no fake popups)
+ * - handoffs insert payload matches DB (NO author_user_id / snapshot)
+ * - updates table holds author_user_id + author_display_name_snapshot
+ */
 
 type Shift = "AM" | "PM" | "NOC";
 type Priority = "Low" | "Normal" | "High" | "Critical";
@@ -83,6 +95,9 @@ function isAbortError(err: any) {
 }
 
 export default function Page() {
+  // ✅ build marker so we can verify mobile is running the newest code
+  const BUILD_TAG = "v3-sticky-boxglow-sort";
+
   const [supabase] = useState(() => getSupabase());
 
   // Auth
@@ -90,7 +105,7 @@ export default function Page() {
   const [email, setEmail] = useState("");
   const [sendingLink, setSendingLink] = useState(false);
 
-  // Display name snapshot (used ONLY for handoff_updates)
+  // Display name snapshot (ONLY for handoff_updates inserts)
   const [displayName, setDisplayName] = useState("JD");
 
   // Data
@@ -114,10 +129,10 @@ export default function Page() {
   const [details, setDetails] = useState("");
   const [needsFollowUp, setNeedsFollowUp] = useState(true);
 
-  // Derived "resolved" (from updates)
+  // Derived resolved index
   const [resolvedIds, setResolvedIds] = useState<Set<string>>(new Set());
 
-  // Mobile responsive
+  // Responsive
   const [isMobile, setIsMobile] = useState(false);
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -136,6 +151,69 @@ export default function Page() {
   }
   function closeDrawer() {
     setDrawerOpen(false);
+  }
+
+  // Sticky create (bulletproof)
+  const createRef = useRef<HTMLElement | null>(null);
+  const [showStickyCreate, setShowStickyCreate] = useState(false);
+
+  useEffect(() => {
+    if (!isMobile) {
+      setShowStickyCreate(false);
+      return;
+    }
+    const onScroll = () => setShowStickyCreate(window.scrollY > 220);
+    onScroll();
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, [isMobile]);
+
+  function scrollToCreate() {
+    closeDrawer();
+    createRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  // Guaranteed priority rank sort
+  const rank: Record<Priority, number> = {
+    Critical: 4,
+    High: 3,
+    Normal: 2,
+    Low: 1,
+  };
+
+  // ✅ box glow visuals
+  function cardBorder(_p: Priority, isResolved: boolean) {
+    return isResolved ? "1px solid rgba(255,255,255,.10)" : "1px solid rgba(255,255,255,.14)";
+  }
+
+  function cardGlow(p: Priority, isResolved: boolean, needsFU: boolean) {
+    if (isResolved) return "none";
+
+    const boost = needsFU ? 1 : 0.65;
+
+    const critical =
+      `0 0 0 1px rgba(255,70,70,0.22), ` +
+      `0 0 38px rgba(255,70,70,${0.28 * boost}), ` +
+      `0 0 80px rgba(255,70,70,${0.12 * boost})`;
+
+    const high =
+      `0 0 0 1px rgba(255,165,0,0.18), ` +
+      `0 0 32px rgba(255,165,0,${0.22 * boost}), ` +
+      `0 0 70px rgba(255,165,0,${0.10 * boost})`;
+
+    const low =
+      `0 0 0 1px rgba(120,180,255,0.16), ` +
+      `0 0 28px rgba(120,180,255,${0.18 * boost}), ` +
+      `0 0 60px rgba(120,180,255,${0.08 * boost})`;
+
+    const normal = needsFU
+      ? `0 0 0 1px rgba(255,255,255,0.10), 0 0 18px rgba(255,255,255,0.10)`
+      : "none";
+
+    if (p === "Critical") return critical;
+    if (p === "High") return high;
+    if (p === "Low") return low;
+    return normal;
   }
 
   // ---------------- AUTH ----------------
@@ -207,8 +285,6 @@ export default function Page() {
       const { data, error } = await supabase
         .from("handoffs")
         .select("*")
-        .order("needs_follow_up", { ascending: false })
-        .order("priority", { ascending: false })
         .order("created_at", { ascending: false });
 
       if (error) throw error;
@@ -217,6 +293,17 @@ export default function Page() {
         ...h,
         details: h.details ?? null,
       }));
+
+      // guaranteed sort: follow-up first, then priority rank, then newest
+      rows.sort((a, b) => {
+        const fu = (b.needs_follow_up ? 1 : 0) - (a.needs_follow_up ? 1 : 0);
+        if (fu !== 0) return fu;
+
+        const pr = (rank[b.priority] ?? 0) - (rank[a.priority] ?? 0);
+        if (pr !== 0) return pr;
+
+        return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+      });
 
       setHandoffs(rows);
       await loadResolvedIndex(rows.map((r) => r.id));
@@ -258,8 +345,6 @@ export default function Page() {
   }
 
   // ---------------- ACTIONS ----------------
-
-  // ✅ IMPORTANT: handoffs insert matches your DB schema (NO author_user_id / snapshot here)
   async function createHandoff() {
     if (!summary.trim()) {
       alert("Summary is required.");
@@ -276,6 +361,7 @@ export default function Page() {
         return;
       }
 
+      // schema-aligned payload (NO author fields)
       const payload = {
         shift,
         location: location.trim(),
@@ -291,6 +377,8 @@ export default function Page() {
       setSummary("");
       setDetails("");
       await loadHandoffs();
+
+      if (isMobile) window.scrollTo({ top: 0, behavior: "smooth" });
     } catch (err: any) {
       if (isAbortError(err)) return;
       console.error("Insert error:", err);
@@ -418,15 +506,10 @@ export default function Page() {
           <p style={{ marginTop: 6, opacity: 0.75 }}>
             Sign in with a magic link (required for RLS).
           </p>
+          <div style={{ opacity: 0.45, fontSize: 12, marginTop: 6 }}>Build: {BUILD_TAG}</div>
         </header>
 
-        <div
-          style={{
-            border: "1px solid rgba(255,255,255,.12)",
-            borderRadius: 16,
-            padding: 16,
-          }}
-        >
+        <div style={{ border: "1px solid rgba(255,255,255,.12)", borderRadius: 16, padding: 16 }}>
           <input
             placeholder="your@email.com"
             value={email}
@@ -441,10 +524,6 @@ export default function Page() {
           >
             {sendingLink ? "Sending…" : "Send magic link"}
           </button>
-
-          <p style={{ marginTop: 10, opacity: 0.7, fontSize: 13 }}>
-            After you click the email link, you’ll come back here signed in.
-          </p>
         </div>
       </div>
     );
@@ -453,6 +532,29 @@ export default function Page() {
   // ---------------- MAIN UI ----------------
   return (
     <div style={{ maxWidth: 1100, margin: "0 auto", padding: isMobile ? 14 : 20 }}>
+      {/* Sticky create (mobile, fixed) */}
+      {isMobile && showStickyCreate && (
+        <div
+          style={{
+            position: "fixed",
+            top: 10,
+            left: 14,
+            right: 14,
+            zIndex: 9999,
+            padding: 10,
+            borderRadius: 14,
+            border: "1px solid rgba(255,255,255,.12)",
+            background: "rgba(10,10,10,0.92)",
+            backdropFilter: "blur(10px)",
+          }}
+        >
+          <button onClick={scrollToCreate} style={{ ...btnStyle, width: "100%", fontWeight: 900 }}>
+            + Create handoff
+          </button>
+        </div>
+      )}
+      {isMobile && showStickyCreate && <div style={{ height: 64 }} />}
+
       <header style={{ marginBottom: 16 }}>
         <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
           <div>
@@ -460,6 +562,7 @@ export default function Page() {
             <p style={{ marginTop: 6, opacity: 0.75 }}>
               Append-only handoff log (Supabase system of record).
             </p>
+            <div style={{ opacity: 0.45, fontSize: 12, marginTop: 6 }}>Build: {BUILD_TAG}</div>
           </div>
 
           <div
@@ -492,11 +595,7 @@ export default function Page() {
       {/* Filters */}
       <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap", marginBottom: 16 }}>
         <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <input
-            type="checkbox"
-            checked={followUpOnly}
-            onChange={(e) => setFollowUpOnly(e.target.checked)}
-          />
+          <input type="checkbox" checked={followUpOnly} onChange={(e) => setFollowUpOnly(e.target.checked)} />
           Follow-up only
         </label>
 
@@ -516,106 +615,57 @@ export default function Page() {
         </button>
       </div>
 
-      {/* Create + desktop Updates */}
-      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap: 16 }}>
-        <section style={{ border: "1px solid rgba(255,255,255,.12)", borderRadius: 16, padding: 16, marginBottom: 18 }}>
-          <h2 style={{ margin: 0, marginBottom: 12, fontSize: 18 }}>Create handoff</h2>
+      {/* Create section */}
+      <section
+        ref={(el) => (createRef.current = el)}
+        style={{
+          border: "1px solid rgba(255,255,255,.12)",
+          borderRadius: 16,
+          padding: 16,
+          marginBottom: 18,
+        }}
+      >
+        <h2 style={{ margin: 0, marginBottom: 12, fontSize: 18 }}>Create handoff</h2>
 
-          <div style={{ display: "grid", gap: 10, gridTemplateColumns: isMobile ? "1fr 1fr" : "1fr 1fr 1fr 1fr" }}>
-            <select value={shift} onChange={(e) => setShift(e.target.value as Shift)} style={inputStyle}>
-              <option value="AM">AM</option>
-              <option value="PM">PM</option>
-              <option value="NOC">NOC</option>
-            </select>
+        <div style={{ display: "grid", gap: 10, gridTemplateColumns: isMobile ? "1fr 1fr" : "1fr 1fr 1fr 1fr" }}>
+          <select value={shift} onChange={(e) => setShift(e.target.value as Shift)} style={inputStyle}>
+            <option value="AM">AM</option>
+            <option value="PM">PM</option>
+            <option value="NOC">NOC</option>
+          </select>
 
-            <input placeholder="Location" value={location} onChange={(e) => setLocation(e.target.value)} style={inputStyle} />
+          <input placeholder="Location" value={location} onChange={(e) => setLocation(e.target.value)} style={inputStyle} />
 
-            <select value={priority} onChange={(e) => setPriority(e.target.value as Priority)} style={inputStyle}>
-              <option value="Normal">Normal</option>
-              <option value="High">High</option>
-              <option value="Critical">Critical</option>
-              <option value="Low">Low</option>
-            </select>
+          <select value={priority} onChange={(e) => setPriority(e.target.value as Priority)} style={inputStyle}>
+            <option value="Normal">Normal</option>
+            <option value="High">High</option>
+            <option value="Critical">Critical</option>
+            <option value="Low">Low</option>
+          </select>
 
-            <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              <input type="checkbox" checked={needsFollowUp} onChange={(e) => setNeedsFollowUp(e.target.checked)} />
-              Follow-up
-            </label>
-          </div>
+          <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <input type="checkbox" checked={needsFollowUp} onChange={(e) => setNeedsFollowUp(e.target.checked)} />
+            Follow-up
+          </label>
+        </div>
 
-          <div style={{ marginTop: 10 }}>
-            <input placeholder="Summary (required)" value={summary} onChange={(e) => setSummary(e.target.value)} style={{ ...inputStyle, width: "100%" }} />
-          </div>
+        <div style={{ marginTop: 10 }}>
+          <input placeholder="Summary (required)" value={summary} onChange={(e) => setSummary(e.target.value)} style={{ ...inputStyle, width: "100%" }} />
+        </div>
 
-          <div style={{ marginTop: 10 }}>
-            <textarea placeholder="Details (optional)…" value={details} onChange={(e) => setDetails(e.target.value)} rows={4} style={{ ...inputStyle, width: "100%", resize: "vertical" }} />
-          </div>
+        <div style={{ marginTop: 10 }}>
+          <textarea placeholder="Details (optional)…" value={details} onChange={(e) => setDetails(e.target.value)} rows={4} style={{ ...inputStyle, width: "100%", resize: "vertical" }} />
+        </div>
 
-          <button onClick={createHandoff} disabled={loading} style={{ ...btnStyle, width: "100%", marginTop: 12, fontWeight: 800 }}>
-            {loading ? "Saving…" : "Save handoff"}
-          </button>
-
-          <p style={{ marginTop: 10, opacity: 0.7, fontSize: 13 }}>
-            Note: This log is append-only. No edits, no deletes—only new entries and updates.
-          </p>
-        </section>
-
-        {!isMobile && (
-          <section style={{ border: "1px solid rgba(255,255,255,.12)", borderRadius: 16, padding: 16, marginBottom: 18 }}>
-            <h2 style={{ margin: 0, marginBottom: 12, fontSize: 18 }}>Updates</h2>
-
-            {!selected ? (
-              <div style={{ opacity: 0.7 }}>Select a handoff from the list to view or add updates.</div>
-            ) : (
-              <>
-                <div style={{ display: "grid", gap: 6 }}>
-                  <div style={{ fontWeight: 900 }}>{selected.location.toUpperCase()}</div>
-                  <div style={{ opacity: 0.8 }}>{selected.shift} · {formatWhen(selected.created_at)}</div>
-                  <div style={{ fontWeight: 900 }}>{selected.summary}</div>
-                  {selected.details ? <div style={{ opacity: 0.9, whiteSpace: "pre-wrap" }}>{selected.details}</div> : null}
-                  <div style={{ opacity: 0.8 }}>
-                    {selected.priority} · {selected.needs_follow_up ? "FOLLOW-UP" : "—"} · {resolvedIds.has(selected.id) ? "Resolved" : "Open"}
-                  </div>
-                </div>
-
-                <div style={{ marginTop: 12, display: "flex", gap: 10 }}>
-                  {!resolvedIds.has(selected.id) && (
-                    <button onClick={() => markResolved(selected.id)} disabled={loading} style={btnStyle}>
-                      Mark resolved
-                    </button>
-                  )}
-                </div>
-
-                <hr style={{ margin: "16px 0", opacity: 0.25 }} />
-
-                <div style={{ display: "grid", gap: 10 }}>
-                  {updates.map((u) => (
-                    <div key={u.id} style={{ borderRadius: 12, padding: 10, border: "1px solid rgba(255,255,255,.10)", opacity: 0.95 }}>
-                      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, fontSize: 12, opacity: 0.8 }}>
-                        <div>{(u.author_display_name_snapshot ?? "—")} · {u.source}</div>
-                        <div>{formatWhen(u.created_at)}</div>
-                      </div>
-                      <div style={{ marginTop: 6, whiteSpace: "pre-wrap" }}>{u.content}</div>
-                    </div>
-                  ))}
-                  {updates.length === 0 && <div style={{ opacity: 0.7 }}>No updates yet.</div>}
-                </div>
-
-                <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
-                  <input placeholder="Add an update (append-only)…" value={newUpdate} onChange={(e) => setNewUpdate(e.target.value)} style={{ ...inputStyle, flex: 1 }} />
-                  <button onClick={addUpdate} disabled={loading || !newUpdate.trim()} style={btnStyle}>Add</button>
-                </div>
-              </>
-            )}
-          </section>
-        )}
-      </div>
+        <button onClick={createHandoff} disabled={loading} style={{ ...btnStyle, width: "100%", marginTop: 12, fontWeight: 800 }}>
+          {loading ? "Saving…" : "Save handoff"}
+        </button>
+      </section>
 
       {/* List */}
       <section style={{ display: "grid", gap: 12 }}>
         {filtered.map((h) => {
           const isResolved = resolvedIds.has(h.id);
-
           return (
             <button
               key={h.id}
@@ -625,7 +675,9 @@ export default function Page() {
                 width: "100%",
                 borderRadius: 16,
                 padding: isMobile ? 12 : 14,
-                border: `1px solid ${isResolved ? "rgba(255,255,255,.10)" : "rgba(255,165,0,.35)"}`,
+                border: cardBorder(h.priority, isResolved),
+                boxShadow: cardGlow(h.priority, isResolved, h.needs_follow_up),
+                transform: "translateZ(0)",
                 opacity: isResolved ? 0.65 : 1,
                 background: "transparent",
                 cursor: "pointer",
@@ -650,8 +702,6 @@ export default function Page() {
             </button>
           );
         })}
-
-        {!loading && filtered.length === 0 && <div style={{ opacity: 0.7, padding: 12 }}>No handoffs match your filters.</div>}
       </section>
 
       {/* Mobile Drawer */}
@@ -682,11 +732,7 @@ export default function Page() {
             }}
           >
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 12px", borderBottom: "1px solid rgba(255,255,255,.10)" }}>
-              <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                <div style={{ width: 40, height: 5, borderRadius: 999, background: "rgba(255,255,255,.18)" }} />
-                <div style={{ fontWeight: 800, opacity: 0.9 }}>Handoff</div>
-              </div>
-
+              <div style={{ fontWeight: 800, opacity: 0.9 }}>Handoff</div>
               <button onClick={closeDrawer} style={{ ...btnStyle, padding: "8px 10px" }}>Close</button>
             </div>
 
@@ -716,23 +762,8 @@ export default function Page() {
 
                   <hr style={{ margin: "16px 0", opacity: 0.25 }} />
 
-                  <div style={{ fontWeight: 900, marginBottom: 8 }}>Updates</div>
-
-                  <div style={{ display: "grid", gap: 10 }}>
-                    {updates.map((u) => (
-                      <div key={u.id} style={{ borderRadius: 12, padding: 10, border: "1px solid rgba(255,255,255,.10)", opacity: 0.95 }}>
-                        <div style={{ display: "flex", justifyContent: "space-between", gap: 10, fontSize: 12, opacity: 0.8 }}>
-                          <div>{(u.author_display_name_snapshot ?? "—")} · {u.source}</div>
-                          <div>{formatWhen(u.created_at)}</div>
-                        </div>
-                        <div style={{ marginTop: 6, whiteSpace: "pre-wrap" }}>{u.content}</div>
-                      </div>
-                    ))}
-                    {updates.length === 0 && <div style={{ opacity: 0.7 }}>No updates yet.</div>}
-                  </div>
-
                   <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
-                    <input placeholder="Add an update (append-only)…" value={newUpdate} onChange={(e) => setNewUpdate(e.target.value)} style={{ ...inputStyle, flex: 1 }} />
+                    <input placeholder="Add an update…" value={newUpdate} onChange={(e) => setNewUpdate(e.target.value)} style={{ ...inputStyle, flex: 1 }} />
                     <button onClick={addUpdate} disabled={loading || !newUpdate.trim()} style={btnStyle}>Add</button>
                   </div>
                 </>
