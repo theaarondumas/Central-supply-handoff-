@@ -4,15 +4,15 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 
 /**
- * FULL SYSTEM CANON (FINAL)
- * - Single scroll container (mobile sticky works reliably)
- * - Sticky "+ Create handoff" driven by container scrollTop
- * - Priority signal via BOX GLOW (boxShadow), border stays neutral
- * - Guaranteed ordering: unresolved -> follow-up -> priority rank -> newest
+ * FULL SYSTEM — FINAL SLEEPY SAFE BUILD
+ * - Sticky "+ Create handoff" ALWAYS visible on mobile
+ * - Critical forced to top (hard-priority)
+ * - Strong box glow + Critical pulse animation (unresolved only)
+ * - Deterministic sort: unresolved -> follow-up -> priority -> newest
  * - Mobile drawer: details + updates + add update + mark resolved
- * - Desktop: updates panel
- * - Auth gate: magic link sign-in
- * - Ignore AbortError (no fake popups)
+ * - Desktop works too (same layout; drawer only on mobile)
+ * - Auth gate: magic link
+ * - AbortError ignored
  * - handoffs insert schema-aligned (NO author_user_id / snapshot)
  * - updates insert includes author_user_id + display snapshot
  */
@@ -24,26 +24,20 @@ type UpdateSource = "app" | "sms" | "system";
 type Handoff = {
   id: string;
   created_at: string;
-
   shift: Shift;
   location: string;
   priority: Priority;
-
   summary: string;
   details: string | null;
-
   needs_follow_up: boolean;
 };
 
 type HandoffUpdate = {
   id: string;
   created_at: string;
-
   handoff_id: string;
-
   author_user_id: string;
   author_display_name_snapshot: string | null;
-
   source: UpdateSource;
   content: string;
 };
@@ -92,20 +86,16 @@ function isAbortError(err: any) {
 }
 
 export default function Page() {
-  // 🔒 Build marker so we know mobile is on the newest code
-  const BUILD_TAG = "FULLSYS-v1-stickyContainer-boxGlow-sort-drawer";
+  const BUILD_TAG = "FULLSYS-vSLEEP-stickyAlways-criticalPulse";
 
   const [supabase] = useState(() => getSupabase());
-
-  // Single scroll container ref (this makes sticky reliable)
-  const scrollerRef = useRef<HTMLDivElement | null>(null);
 
   // Auth
   const [session, setSession] = useState<any>(null);
   const [email, setEmail] = useState("");
   const [sendingLink, setSendingLink] = useState(false);
 
-  // Snapshot display name (ONLY used in handoff_updates)
+  // Snapshot display name (ONLY used in handoff_updates inserts)
   const [displayName, setDisplayName] = useState("JD");
 
   // Data
@@ -151,24 +141,8 @@ export default function Page() {
     setDrawerOpen(false);
   }
 
-  // Sticky create (container-scroll driven)
+  // Scroll-to-create anchor
   const createRef = useRef<HTMLElement | null>(null);
-  const [showStickyCreate, setShowStickyCreate] = useState(false);
-
-  useEffect(() => {
-    if (!isMobile) {
-      setShowStickyCreate(false);
-      return;
-    }
-    const scroller = scrollerRef.current;
-    if (!scroller) return;
-
-    const onScroll = () => setShowStickyCreate(scroller.scrollTop > 220);
-    onScroll();
-    scroller.addEventListener("scroll", onScroll, { passive: true });
-    return () => scroller.removeEventListener("scroll", onScroll as any);
-  }, [isMobile]);
-
   function scrollToCreate() {
     closeDrawer();
     createRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -182,7 +156,7 @@ export default function Page() {
     Low: 1,
   };
 
-  // Box glow (border neutral)
+  // Border stays neutral; glow carries urgency
   function cardBorder(isResolved: boolean) {
     return isResolved ? "1px solid rgba(255,255,255,.10)" : "1px solid rgba(255,255,255,.14)";
   }
@@ -190,31 +164,38 @@ export default function Page() {
   function cardGlow(p: Priority, isResolved: boolean, needsFU: boolean) {
     if (isResolved) return "none";
 
-    const boost = needsFU ? 1 : 0.65;
+    const boost = needsFU ? 1 : 0.75;
 
     const critical =
-      `0 0 0 1px rgba(255,70,70,0.22), ` +
-      `0 0 38px rgba(255,70,70,${0.28 * boost}), ` +
-      `0 0 88px rgba(255,70,70,${0.14 * boost})`;
+      `0 0 0 2px rgba(255,70,70,0.35), ` +
+      `0 0 48px rgba(255,70,70,${0.55 * boost}), ` +
+      `0 0 120px rgba(255,70,70,${0.35 * boost})`;
 
     const high =
-      `0 0 0 1px rgba(255,165,0,0.18), ` +
-      `0 0 32px rgba(255,165,0,${0.22 * boost}), ` +
-      `0 0 78px rgba(255,165,0,${0.12 * boost})`;
+      `0 0 0 2px rgba(255,165,0,0.30), ` +
+      `0 0 40px rgba(255,165,0,${0.45 * boost}), ` +
+      `0 0 100px rgba(255,165,0,${0.28 * boost})`;
 
     const low =
-      `0 0 0 1px rgba(120,180,255,0.16), ` +
-      `0 0 28px rgba(120,180,255,${0.18 * boost}), ` +
-      `0 0 68px rgba(120,180,255,${0.10 * boost})`;
+      `0 0 0 2px rgba(120,180,255,0.24), ` +
+      `0 0 30px rgba(120,180,255,${0.30 * boost}), ` +
+      `0 0 80px rgba(120,180,255,${0.18 * boost})`;
 
     const normal = needsFU
-      ? `0 0 0 1px rgba(255,255,255,0.10), 0 0 18px rgba(255,255,255,0.10)`
+      ? `0 0 0 1px rgba(255,255,255,0.10), 0 0 18px rgba(255,255,255,0.12)`
       : "none";
 
     if (p === "Critical") return critical;
     if (p === "High") return high;
     if (p === "Low") return low;
     return normal;
+  }
+
+  function criticalPulseStyle(isCritical: boolean, isResolved: boolean) {
+    if (!isCritical || isResolved) return {};
+    return {
+      animation: "criticalPulse 1.4s ease-in-out infinite",
+    } as React.CSSProperties;
   }
 
   /* ---------------- AUTH WIRING ---------------- */
@@ -254,7 +235,7 @@ export default function Page() {
       .in("handoff_id", handoffIds)
       .eq("source", "system")
       .ilike("content", "Marked as resolved%")
-      .limit(500);
+      .limit(1000);
 
     if (error) {
       console.warn("Resolved index load warning:", error);
@@ -290,14 +271,18 @@ export default function Page() {
       const rset = await fetchResolvedSet(rows.map((r) => r.id));
       setResolvedIds(rset);
 
-      // ORDER: unresolved -> follow-up -> priority -> newest
+      // ORDER: unresolved first -> follow-up -> Critical hard top -> rank -> newest
       rows.sort((a, b) => {
         const ar = rset.has(a.id) ? 1 : 0;
         const br = rset.has(b.id) ? 1 : 0;
-        if (ar !== br) return ar - br;
+        if (ar !== br) return ar - br; // unresolved first
 
         const fu = (b.needs_follow_up ? 1 : 0) - (a.needs_follow_up ? 1 : 0);
         if (fu !== 0) return fu;
+
+        // hard-push Critical above everything unresolved
+        if (a.priority === "Critical" && b.priority !== "Critical") return -1;
+        if (b.priority === "Critical" && a.priority !== "Critical") return 1;
 
         const pr = (rank[b.priority] ?? 0) - (rank[a.priority] ?? 0);
         if (pr !== 0) return pr;
@@ -357,6 +342,7 @@ export default function Page() {
         return;
       }
 
+      // Schema-aligned payload (NO author fields)
       const payload = {
         shift,
         location: location.trim(),
@@ -372,11 +358,6 @@ export default function Page() {
       setSummary("");
       setDetails("");
       await loadHandoffs();
-
-      // scroll container to top on mobile
-      if (isMobile && scrollerRef.current) {
-        scrollerRef.current.scrollTo({ top: 0, behavior: "smooth" });
-      }
     } catch (err: any) {
       if (isAbortError(err)) return;
       console.error("Insert error:", err);
@@ -523,19 +504,18 @@ export default function Page() {
 
   /* ---------------- MAIN UI ---------------- */
   return (
-    <div
-      ref={scrollerRef}
-      style={{
-        height: "100dvh",
-        overflowY: "auto",
-        WebkitOverflowScrolling: "touch",
-        padding: 14,
-        maxWidth: 1100,
-        margin: "0 auto",
-      }}
-    >
-      {/* Sticky create (inside same scroll container) */}
-      {isMobile && showStickyCreate && (
+    <div style={{ maxWidth: 1100, margin: "0 auto", padding: 14 }}>
+      {/* Keyframes for Critical pulse */}
+      <style>{`
+        @keyframes criticalPulse {
+          0%   { filter: brightness(1); }
+          50%  { filter: brightness(1.18); }
+          100% { filter: brightness(1); }
+        }
+      `}</style>
+
+      {/* Sticky Create ALWAYS on mobile */}
+      {isMobile && (
         <div
           style={{
             position: "sticky",
@@ -662,6 +642,7 @@ export default function Page() {
       <section style={{ display: "grid", gap: 12 }}>
         {filtered.map((h) => {
           const isResolved = resolvedIds.has(h.id);
+          const isCritical = h.priority === "Critical" && !isResolved;
 
           return (
             <button
@@ -678,6 +659,7 @@ export default function Page() {
                 opacity: isResolved ? 0.60 : 1,
                 background: "transparent",
                 cursor: "pointer",
+                ...(isCritical ? { animation: "criticalPulse 1.4s ease-in-out infinite" } : {}),
               }}
             >
               <div style={{ display: "flex", gap: 10, alignItems: "baseline", flexWrap: "wrap" }}>
