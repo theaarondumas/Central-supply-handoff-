@@ -117,6 +117,17 @@ export default function Page() {
   // Derived "resolved" (from updates)
   const [resolvedIds, setResolvedIds] = useState<Set<string>>(new Set());
 
+  // ✅ MOBILE RESPONSIVE FLAG (max-width 900px)
+  const [isMobile, setIsMobile] = useState(false);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const mq = window.matchMedia("(max-width: 900px)");
+    const apply = () => setIsMobile(mq.matches);
+    apply();
+    mq.addEventListener?.("change", apply);
+    return () => mq.removeEventListener?.("change", apply);
+  }, []);
+
   // ---------------- AUTH WIRING ----------------
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session));
@@ -216,7 +227,6 @@ export default function Page() {
       return;
     }
 
-    // Keep it light: only fetch system events for these handoffs
     const { data, error } = await supabase
       .from("handoff_updates")
       .select("handoff_id, created_at, content, source")
@@ -305,7 +315,6 @@ export default function Page() {
 
       if (error) throw error;
 
-      // Refresh
       await loadHandoffs();
       if (selectedId === handoffId) await loadUpdates(handoffId);
     } catch (err: any) {
@@ -354,14 +363,8 @@ export default function Page() {
     }
   }
 
-  // ❌ No delete in append-only model
-  async function deleteHandoffBlocked() {
-    alert("Delete is disabled. This system is append-only (audit-safe).");
-  }
-
   // ---------------- EFFECTS ----------------
   useEffect(() => {
-    // Load only after session exists (RLS)
     if (session) loadHandoffs();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session]);
@@ -380,7 +383,6 @@ export default function Page() {
     return handoffs.filter((h) => {
       const isResolved = resolvedIds.has(h.id);
 
-      // Follow-up only = unresolved + needs follow-up (action queue)
       if (followUpOnly) {
         if (isResolved) return false;
         if (!h.needs_follow_up) return false;
@@ -403,7 +405,7 @@ export default function Page() {
   // ---------------- AUTH GATE ----------------
   if (!session) {
     return (
-      <div style={{ maxWidth: 560, margin: "0 auto", padding: 20 }}>
+      <div style={{ maxWidth: 560, margin: "0 auto", padding: isMobile ? 14 : 20 }}>
         <header style={{ marginBottom: 16 }}>
           <h1 style={{ fontSize: 34, fontWeight: 800, margin: 0 }}>Central Supply Handoff</h1>
           <p style={{ marginTop: 6, opacity: 0.75 }}>
@@ -443,9 +445,16 @@ export default function Page() {
 
   // ---------------- MAIN UI ----------------
   return (
-    <div style={{ maxWidth: 1100, margin: "0 auto", padding: 20 }}>
+    <div style={{ maxWidth: 1100, margin: "0 auto", padding: isMobile ? 14 : 20 }}>
       <header style={{ marginBottom: 16 }}>
-        <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+        <div
+          style={{
+            display: "flex",
+            gap: 12,
+            alignItems: "center",
+            flexWrap: "wrap",
+          }}
+        >
           <div>
             <h1 style={{ fontSize: 34, fontWeight: 800, margin: 0 }}>Central Supply Handoff</h1>
             <p style={{ marginTop: 6, opacity: 0.75 }}>
@@ -453,12 +462,25 @@ export default function Page() {
             </p>
           </div>
 
-          <div style={{ marginLeft: "auto", display: "flex", gap: 10, alignItems: "center" }}>
+          <div
+            style={{
+              marginLeft: isMobile ? 0 : "auto",
+              width: isMobile ? "100%" : "auto",
+              display: "flex",
+              gap: 10,
+              alignItems: "center",
+              justifyContent: isMobile ? "space-between" : "flex-end",
+            }}
+          >
             <input
               placeholder="Display name (optional)"
               value={displayName}
               onChange={(e) => setDisplayName(e.target.value)}
-              style={{ ...inputStyle, minWidth: 200 }}
+              style={{
+                ...inputStyle,
+                minWidth: isMobile ? 0 : 200,
+                flex: isMobile ? 1 : "unset",
+              }}
             />
             <button onClick={signOut} style={btnStyle}>
               Sign out
@@ -492,7 +514,8 @@ export default function Page() {
           onChange={(e) => setLocationFilter(e.target.value)}
           style={{
             ...inputStyle,
-            minWidth: 220,
+            minWidth: isMobile ? 0 : 220,
+            flex: isMobile ? 1 : "unset",
           }}
         />
 
@@ -505,7 +528,13 @@ export default function Page() {
         </button>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr",
+          gap: 16,
+        }}
+      >
         {/* Create handoff */}
         <section
           style={{
@@ -517,8 +546,18 @@ export default function Page() {
         >
           <h2 style={{ margin: 0, marginBottom: 12, fontSize: 18 }}>Create handoff</h2>
 
-          <div style={{ display: "grid", gap: 10, gridTemplateColumns: "1fr 1fr 1fr 1fr" }}>
-            <select value={shift} onChange={(e) => setShift(e.target.value as Shift)} style={inputStyle}>
+          <div
+            style={{
+              display: "grid",
+              gap: 10,
+              gridTemplateColumns: isMobile ? "1fr 1fr" : "1fr 1fr 1fr 1fr",
+            }}
+          >
+            <select
+              value={shift}
+              onChange={(e) => setShift(e.target.value as Shift)}
+              style={inputStyle}
+            >
               <option value="AM">AM</option>
               <option value="PM">PM</option>
               <option value="NOC">NOC</option>
@@ -531,7 +570,11 @@ export default function Page() {
               style={inputStyle}
             />
 
-            <select value={priority} onChange={(e) => setPriority(e.target.value as Priority)} style={inputStyle}>
+            <select
+              value={priority}
+              onChange={(e) => setPriority(e.target.value as Priority)}
+              style={inputStyle}
+            >
               <option value="Normal">Normal</option>
               <option value="High">High</option>
               <option value="Critical">Critical</option>
@@ -602,7 +645,9 @@ export default function Page() {
                   {selected.author_display_name_snapshot ? `by ${selected.author_display_name_snapshot}` : ""}
                 </div>
                 <div style={{ fontWeight: 900 }}>{selected.summary}</div>
-                {selected.details ? <div style={{ opacity: 0.9, whiteSpace: "pre-wrap" }}>{selected.details}</div> : null}
+                {selected.details ? (
+                  <div style={{ opacity: 0.9, whiteSpace: "pre-wrap" }}>{selected.details}</div>
+                ) : null}
                 <div style={{ opacity: 0.8 }}>
                   {selected.priority} · {selected.needs_follow_up ? "FOLLOW-UP" : "—"} ·{" "}
                   {resolvedIds.has(selected.id) ? "Resolved" : "Open"}
@@ -614,7 +659,7 @@ export default function Page() {
                   <button onClick={() => markResolved(selected.id)} disabled={loading} style={btnStyle}>
                     Mark resolved
                   </button>
-                )} 
+                )}
               </div>
 
               <hr style={{ margin: "16px 0", opacity: 0.25 }} />
@@ -630,7 +675,15 @@ export default function Page() {
                       opacity: 0.95,
                     }}
                   >
-                    <div style={{ display: "flex", justifyContent: "space-between", gap: 10, fontSize: 12, opacity: 0.8 }}>
+                    <div
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        gap: 10,
+                        fontSize: 12,
+                        opacity: 0.8,
+                      }}
+                    >
                       <div>
                         {(u.author_display_name_snapshot ?? "—")} · {u.source}
                       </div>
@@ -672,7 +725,7 @@ export default function Page() {
                 textAlign: "left",
                 width: "100%",
                 borderRadius: 16,
-                padding: 14,
+                padding: isMobile ? 12 : 14,
                 border: `1px solid ${isResolved ? "rgba(255,255,255,.10)" : "rgba(255,165,0,.35)"}`,
                 opacity: isResolved ? 0.65 : 1,
                 background: "transparent",
@@ -694,7 +747,7 @@ export default function Page() {
                 </div>
               </div>
 
-              <div style={{ marginTop: 8, fontSize: 18, fontWeight: 900 }}>
+              <div style={{ marginTop: 8, fontSize: isMobile ? 16 : 18, fontWeight: 900 }}>
                 {h.summary.toUpperCase()}
               </div>
 
