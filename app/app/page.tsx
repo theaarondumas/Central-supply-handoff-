@@ -117,7 +117,7 @@ export default function Page() {
   // Derived "resolved" (from updates)
   const [resolvedIds, setResolvedIds] = useState<Set<string>>(new Set());
 
-  // ✅ MOBILE RESPONSIVE FLAG (max-width 900px)
+  // ✅ MOBILE RESPONSIVE FLAG
   const [isMobile, setIsMobile] = useState(false);
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -127,6 +127,16 @@ export default function Page() {
     mq.addEventListener?.("change", apply);
     return () => mq.removeEventListener?.("change", apply);
   }, []);
+
+  // ✅ MOBILE DRAWER STATE
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  function openDrawerFor(id: string) {
+    setSelectedId(id);
+    setDrawerOpen(true);
+  }
+  function closeDrawer() {
+    setDrawerOpen(false);
+  }
 
   // ---------------- AUTH WIRING ----------------
   useEffect(() => {
@@ -152,13 +162,13 @@ export default function Page() {
     setSelectedId(null);
     setUpdates([]);
     setHandoffs([]);
+    setDrawerOpen(false);
   }
 
   // ---------------- LOADERS ----------------
   async function loadHandoffs() {
     setLoading(true);
     try {
-      // ✅ Guard: only query when authenticated (RLS)
       const { data: userRes, error: userErr } = await supabase.auth.getUser();
       if (userErr) throw userErr;
       if (!userRes?.user) {
@@ -183,8 +193,6 @@ export default function Page() {
       }));
 
       setHandoffs(rows);
-
-      // ✅ derive resolved from append-only updates
       await loadResolvedIndex(rows.map((r) => r.id));
     } catch (err: any) {
       console.error("LoadHandoffs FULL error:", err);
@@ -220,7 +228,6 @@ export default function Page() {
     }
   }
 
-  // Pull recent "Marked as resolved" events and build a Set of resolved handoff_ids
   async function loadResolvedIndex(handoffIds: string[]) {
     if (handoffIds.length === 0) {
       setResolvedIds(new Set());
@@ -293,7 +300,6 @@ export default function Page() {
     }
   }
 
-  // ✅ Append-only "resolve": insert an update event (NO updates to handoffs)
   async function markResolved(handoffId: string) {
     setLoading(true);
     try {
@@ -325,7 +331,6 @@ export default function Page() {
     }
   }
 
-  // ✅ Append-only user update
   async function addUpdate() {
     if (!selectedId) {
       alert("Select a handoff first.");
@@ -528,6 +533,7 @@ export default function Page() {
         </button>
       </div>
 
+      {/* Desktop only: Create + Updates side by side */}
       <div
         style={{
           display: "grid",
@@ -553,11 +559,7 @@ export default function Page() {
               gridTemplateColumns: isMobile ? "1fr 1fr" : "1fr 1fr 1fr 1fr",
             }}
           >
-            <select
-              value={shift}
-              onChange={(e) => setShift(e.target.value as Shift)}
-              style={inputStyle}
-            >
+            <select value={shift} onChange={(e) => setShift(e.target.value as Shift)} style={inputStyle}>
               <option value="AM">AM</option>
               <option value="PM">PM</option>
               <option value="NOC">NOC</option>
@@ -570,11 +572,7 @@ export default function Page() {
               style={inputStyle}
             />
 
-            <select
-              value={priority}
-              onChange={(e) => setPriority(e.target.value as Priority)}
-              style={inputStyle}
-            >
+            <select value={priority} onChange={(e) => setPriority(e.target.value as Priority)} style={inputStyle}>
               <option value="Normal">Normal</option>
               <option value="High">High</option>
               <option value="Critical">Critical</option>
@@ -623,93 +621,95 @@ export default function Page() {
           </p>
         </section>
 
-        {/* Thread / updates */}
-        <section
-          style={{
-            border: "1px solid rgba(255,255,255,.12)",
-            borderRadius: 16,
-            padding: 16,
-            marginBottom: 18,
-          }}
-        >
-          <h2 style={{ margin: 0, marginBottom: 12, fontSize: 18 }}>Updates</h2>
+        {/* Updates panel: desktop only */}
+        {!isMobile && (
+          <section
+            style={{
+              border: "1px solid rgba(255,255,255,.12)",
+              borderRadius: 16,
+              padding: 16,
+              marginBottom: 18,
+            }}
+          >
+            <h2 style={{ margin: 0, marginBottom: 12, fontSize: 18 }}>Updates</h2>
 
-          {!selected ? (
-            <div style={{ opacity: 0.7 }}>Select a handoff from the list to view or add updates.</div>
-          ) : (
-            <>
-              <div style={{ display: "grid", gap: 6 }}>
-                <div style={{ fontWeight: 900 }}>{selected.location.toUpperCase()}</div>
-                <div style={{ opacity: 0.8 }}>
-                  {selected.shift} · {formatWhen(selected.created_at)} ·{" "}
-                  {selected.author_display_name_snapshot ? `by ${selected.author_display_name_snapshot}` : ""}
+            {!selected ? (
+              <div style={{ opacity: 0.7 }}>Select a handoff from the list to view or add updates.</div>
+            ) : (
+              <>
+                <div style={{ display: "grid", gap: 6 }}>
+                  <div style={{ fontWeight: 900 }}>{selected.location.toUpperCase()}</div>
+                  <div style={{ opacity: 0.8 }}>
+                    {selected.shift} · {formatWhen(selected.created_at)} ·{" "}
+                    {selected.author_display_name_snapshot ? `by ${selected.author_display_name_snapshot}` : ""}
+                  </div>
+                  <div style={{ fontWeight: 900 }}>{selected.summary}</div>
+                  {selected.details ? (
+                    <div style={{ opacity: 0.9, whiteSpace: "pre-wrap" }}>{selected.details}</div>
+                  ) : null}
+                  <div style={{ opacity: 0.8 }}>
+                    {selected.priority} · {selected.needs_follow_up ? "FOLLOW-UP" : "—"} ·{" "}
+                    {resolvedIds.has(selected.id) ? "Resolved" : "Open"}
+                  </div>
                 </div>
-                <div style={{ fontWeight: 900 }}>{selected.summary}</div>
-                {selected.details ? (
-                  <div style={{ opacity: 0.9, whiteSpace: "pre-wrap" }}>{selected.details}</div>
-                ) : null}
-                <div style={{ opacity: 0.8 }}>
-                  {selected.priority} · {selected.needs_follow_up ? "FOLLOW-UP" : "—"} ·{" "}
-                  {resolvedIds.has(selected.id) ? "Resolved" : "Open"}
+
+                <div style={{ marginTop: 12, display: "flex", gap: 10 }}>
+                  {!resolvedIds.has(selected.id) && (
+                    <button onClick={() => markResolved(selected.id)} disabled={loading} style={btnStyle}>
+                      Mark resolved
+                    </button>
+                  )}
                 </div>
-              </div>
 
-              <div style={{ marginTop: 12, display: "flex", gap: 10 }}>
-                {!resolvedIds.has(selected.id) && (
-                  <button onClick={() => markResolved(selected.id)} disabled={loading} style={btnStyle}>
-                    Mark resolved
-                  </button>
-                )}
-              </div>
+                <hr style={{ margin: "16px 0", opacity: 0.25 }} />
 
-              <hr style={{ margin: "16px 0", opacity: 0.25 }} />
-
-              <div style={{ display: "grid", gap: 10 }}>
-                {updates.map((u) => (
-                  <div
-                    key={u.id}
-                    style={{
-                      borderRadius: 12,
-                      padding: 10,
-                      border: "1px solid rgba(255,255,255,.10)",
-                      opacity: 0.95,
-                    }}
-                  >
+                <div style={{ display: "grid", gap: 10 }}>
+                  {updates.map((u) => (
                     <div
+                      key={u.id}
                       style={{
-                        display: "flex",
-                        justifyContent: "space-between",
-                        gap: 10,
-                        fontSize: 12,
-                        opacity: 0.8,
+                        borderRadius: 12,
+                        padding: 10,
+                        border: "1px solid rgba(255,255,255,.10)",
+                        opacity: 0.95,
                       }}
                     >
-                      <div>
-                        {(u.author_display_name_snapshot ?? "—")} · {u.source}
+                      <div
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          gap: 10,
+                          fontSize: 12,
+                          opacity: 0.8,
+                        }}
+                      >
+                        <div>
+                          {(u.author_display_name_snapshot ?? "—")} · {u.source}
+                        </div>
+                        <div>{formatWhen(u.created_at)}</div>
                       </div>
-                      <div>{formatWhen(u.created_at)}</div>
+                      <div style={{ marginTop: 6, whiteSpace: "pre-wrap" }}>{u.content}</div>
                     </div>
-                    <div style={{ marginTop: 6, whiteSpace: "pre-wrap" }}>{u.content}</div>
-                  </div>
-                ))}
+                  ))}
 
-                {updates.length === 0 && <div style={{ opacity: 0.7 }}>No updates yet.</div>}
-              </div>
+                  {updates.length === 0 && <div style={{ opacity: 0.7 }}>No updates yet.</div>}
+                </div>
 
-              <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
-                <input
-                  placeholder="Add an update (append-only)…"
-                  value={newUpdate}
-                  onChange={(e) => setNewUpdate(e.target.value)}
-                  style={{ ...inputStyle, flex: 1 }}
-                />
-                <button onClick={addUpdate} disabled={loading || !newUpdate.trim()} style={btnStyle}>
-                  Add
-                </button>
-              </div>
-            </>
-          )}
-        </section>
+                <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+                  <input
+                    placeholder="Add an update (append-only)…"
+                    value={newUpdate}
+                    onChange={(e) => setNewUpdate(e.target.value)}
+                    style={{ ...inputStyle, flex: 1 }}
+                  />
+                  <button onClick={addUpdate} disabled={loading || !newUpdate.trim()} style={btnStyle}>
+                    Add
+                  </button>
+                </div>
+              </>
+            )}
+          </section>
+        )}
       </div>
 
       {/* List */}
@@ -720,7 +720,7 @@ export default function Page() {
           return (
             <button
               key={h.id}
-              onClick={() => setSelectedId(h.id)}
+              onClick={() => (isMobile ? openDrawerFor(h.id) : setSelectedId(h.id))}
               style={{
                 textAlign: "left",
                 width: "100%",
@@ -762,6 +762,157 @@ export default function Page() {
           <div style={{ opacity: 0.7, padding: 12 }}>No handoffs match your filters.</div>
         )}
       </section>
+
+      {/* ✅ MOBILE DRAWER */}
+      {isMobile && drawerOpen && (
+        <div
+          onClick={closeDrawer}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.55)",
+            zIndex: 9999,
+            display: "flex",
+            alignItems: "flex-end",
+            justifyContent: "center",
+            padding: 12,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: "100%",
+              maxWidth: 760,
+              borderRadius: 18,
+              border: "1px solid rgba(255,255,255,.14)",
+              background: "rgba(10,10,10,0.98)",
+              boxShadow: "0 20px 60px rgba(0,0,0,0.55)",
+              overflow: "hidden",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                padding: "10px 12px",
+                borderBottom: "1px solid rgba(255,255,255,.10)",
+              }}
+            >
+              <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                <div
+                  style={{
+                    width: 40,
+                    height: 5,
+                    borderRadius: 999,
+                    background: "rgba(255,255,255,.18)",
+                  }}
+                />
+                <div style={{ fontWeight: 800, opacity: 0.9 }}>Handoff</div>
+              </div>
+
+              <button onClick={closeDrawer} style={{ ...btnStyle, padding: "8px 10px" }}>
+                Close
+              </button>
+            </div>
+
+            <div style={{ padding: 12 }}>
+              {!selected ? (
+                <div style={{ opacity: 0.75 }}>Select a handoff…</div>
+              ) : (
+                <>
+                  <div style={{ display: "grid", gap: 6 }}>
+                    <div style={{ fontWeight: 900, fontSize: 16 }}>
+                      {selected.location.toUpperCase()} · {selected.shift}
+                    </div>
+                    <div style={{ opacity: 0.8, fontSize: 13 }}>
+                      {formatWhen(selected.created_at)}
+                      {selected.author_display_name_snapshot
+                        ? ` · by ${selected.author_display_name_snapshot}`
+                        : ""}
+                    </div>
+
+                    <div style={{ fontWeight: 900, fontSize: 18 }}>{selected.summary}</div>
+
+                    {selected.details ? (
+                      <div style={{ opacity: 0.9, whiteSpace: "pre-wrap" }}>{selected.details}</div>
+                    ) : null}
+
+                    <div style={{ opacity: 0.8, fontSize: 13 }}>
+                      {selected.priority} · {selected.needs_follow_up ? "FOLLOW-UP" : "—"} ·{" "}
+                      {resolvedIds.has(selected.id) ? "Resolved" : "Open"}
+                    </div>
+                  </div>
+
+                  <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+                    {!resolvedIds.has(selected.id) && (
+                      <button
+                        onClick={() => markResolved(selected.id)}
+                        disabled={loading}
+                        style={{ ...btnStyle, flex: 1 }}
+                      >
+                        Mark resolved
+                      </button>
+                    )}
+
+                    <button onClick={closeDrawer} style={{ ...btnStyle, flex: 1, opacity: 0.9 }}>
+                      Back
+                    </button>
+                  </div>
+
+                  <hr style={{ margin: "16px 0", opacity: 0.25 }} />
+
+                  <div style={{ fontWeight: 900, marginBottom: 8 }}>Updates</div>
+
+                  <div style={{ display: "grid", gap: 10 }}>
+                    {updates.map((u) => (
+                      <div
+                        key={u.id}
+                        style={{
+                          borderRadius: 12,
+                          padding: 10,
+                          border: "1px solid rgba(255,255,255,.10)",
+                          opacity: 0.95,
+                        }}
+                      >
+                        <div
+                          style={{
+                            display: "flex",
+                            justifyContent: "space-between",
+                            gap: 10,
+                            fontSize: 12,
+                            opacity: 0.8,
+                          }}
+                        >
+                          <div>
+                            {(u.author_display_name_snapshot ?? "—")} · {u.source}
+                          </div>
+                          <div>{formatWhen(u.created_at)}</div>
+                        </div>
+                        <div style={{ marginTop: 6, whiteSpace: "pre-wrap" }}>{u.content}</div>
+                      </div>
+                    ))}
+
+                    {updates.length === 0 && <div style={{ opacity: 0.7 }}>No updates yet.</div>}
+                  </div>
+
+                  <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+                    <input
+                      placeholder="Add an update (append-only)…"
+                      value={newUpdate}
+                      onChange={(e) => setNewUpdate(e.target.value)}
+                      style={{ ...inputStyle, flex: 1 }}
+                    />
+                    <button onClick={addUpdate} disabled={loading || !newUpdate.trim()} style={btnStyle}>
+                      Add
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
